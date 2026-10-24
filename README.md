@@ -36,6 +36,33 @@ gap: it shows any website (online or a local file) as your desktop wallpaper, be
 
 To check the link first, open it in Safari.
 
+Plash has two limits worth knowing:
+
+- It shows the page on **one display only**, the one picked in its settings.
+- It leaves out the **menu bar strip** at the top of the screen. If you hide the macOS menu bar
+  (for example behind SketchyBar), your old wallpaper shows through there. Setting the normal macOS
+  wallpaper to the solid colour `#0B0F19` (System Settings → Wallpaper → Colors → Add Color) makes
+  that strip match.
+
+### Every display, edge to edge: the built-in helper
+
+`macos/wallpaper.swift` is a small native helper that does what Plash can't. It shows the page on
+**every display**, covering the **whole screen including behind the menu bar**, under your desktop
+icons and on every Space. Clicks go straight through to the desktop.
+
+It needs the Xcode command line tools (`xcode-select --install` if `swiftc` is missing). Quit
+Plash first so the two don't stack. Then run this from the repository folder:
+
+```sh
+swiftc -O macos/wallpaper.swift -o ascii-wallpaper
+./ascii-wallpaper                              # this folder's index.html
+./ascii-wallpaper "index.html?fps=10&petals=2" # with options
+./ascii-wallpaper "ascii-rest.html?piece=lantern-lake"
+```
+
+Ctrl-C stops it. To keep it running after you close the terminal, use
+`nohup ./ascii-wallpaper >/dev/null 2>&1 &`, and stop it with `pkill ascii-wallpaper`.
+
 ### Tweaks
 
 Add options to the end of the link, like
