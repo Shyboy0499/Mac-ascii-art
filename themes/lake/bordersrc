@@ -1,0 +1,15 @@
+#!/bin/bash
+# Swan Lake Mist: window borders for JankyBorders to match lake.html.
+# Copy the two colour lines into your own ~/.config/borders/bordersrc (or the
+# `borders ...` line in aerospace.toml's after-startup-command) and keep your
+# own style and width. Colours are 0xAARRGGBB.
+
+options=(
+  style=round
+  width=5.0
+  hidpi=on
+  active_color=0xffdadde0     # bright fog, close to the swan's white
+  inactive_color=0xff1b241c   # the forest
+)
+
+borders "${options[@]}"

@@ -117,3 +117,18 @@ light, the blossoms and the falling petals. Each cell then becomes one halftone 
 size is the cell's brightness, with an ordered dither, and its colour is the nearest one in a
 palette sampled from the original wallpaper photo. Dots are drawn once into an atlas and copied
 into place, and only cells that changed get redrawn.
+
+## Matching colours for SketchyBar and window borders
+
+`themes/lake/` has colours to match the swan lake, sampled from the same photo: dark forest-green
+pills over the fog, fog-grey text, the focused workspace as a white pill (the swan), and window
+borders in bright fog (focused) and forest green (the rest). Colours are `0xAARRGGBB`.
+
+- **SketchyBar:** `themes/lake/colors.sh` uses the usual `colors.sh` names (`BAR_COLOR`,
+  `ICON_COLOR`, `LABEL_COLOR`, `BACKGROUND_1`, …). Copy its values into your
+  `~/.config/sketchybar/colors.sh` (or wherever your config keeps its colours), then run
+  `sketchybar --reload`.
+- **Borders (JankyBorders):** copy the `active_color` and `inactive_color` lines from
+  `themes/lake/bordersrc` into `~/.config/borders/bordersrc`, or into the `borders …` command in
+  your `aerospace.toml`. To apply them right away, run
+  `borders active_color=0xffdadde0 inactive_color=0xff1b241c`.
