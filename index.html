@@ -1,0 +1,773 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plum Blossom Night</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0f19; }
+  canvas { position: fixed; left: 0; top: 0; display: block; }
+</style>
+</head>
+<body>
+<canvas id="wall"></canvas>
+<script>
+/*
+ * plum blossom night: a branch of plum blossom crossing in front of a temple
+ * roof at night, in the colours of the photo it was drawn from. A breeze comes
+ * and goes: the branch sways, the hanging sprays swing, petals let go and
+ * drift down, dew on the bark catches the light, and mist moves over the dark
+ * facade behind.
+ *
+ * Every cell of a square grid is shaded in colour, then drawn as a halftone
+ * dot: its size is the cell's brightness (ordered-dithered), its colour the
+ * nearest in a palette sampled from the wallpaper.
+ *
+ * Options, as URL parameters: index.html?cell=8&fps=15&petals=1&wind=1&seed=7
+ *   cell    size of a grid cell in screen points (smaller = finer, more CPU)
+ *   fps     frames a second
+ *   petals  how many petals fall (0 for none)
+ *   wind    how strong the breeze is (0 for still air)
+ *   seed    a different arrangement of the blossoms
+ *   ramp    dots (default) or ascii, to draw with " .:-=+*#%@" instead
+ *   still   1 to draw one frame and stop (no animation, no CPU)
+ */
+(() => {
+'use strict';
+
+const Q = new URLSearchParams(location.search);
+const opt = (k, d, lo, hi) => {
+  const v = parseFloat(Q.get(k));
+  return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d;
+};
+const CELL = opt('cell', 8, 3, 40);
+const FPS = opt('fps', 15, 1, 60);
+const PETALS = opt('petals', 1, 0, 6);
+const WIND = opt('wind', 1, 0, 4);
+const SEED = opt('seed', 7, 0, 1e9) | 0;
+const ASCII = Q.get('ramp') === 'ascii';
+
+// Sampled from the wallpaper: the night blues from its darkest corner up to
+// the lit roof, the icy white of the petals, the bark, the raspberry of the
+// calyxes and buds, and the lavender of the out-of-focus blossoms.
+const GROUND = '#0b0f19';
+const PALETTE = [
+  '#151b27', '#1a202e', '#202838', '#262f42', '#2d374d', '#333f57', '#3d4a66',
+  '#465574', '#51628a', '#5d719a', '#6b80ad', '#7b8fc0', '#879dd2', '#94ade5', '#a5c0f2', '#b7d3fd',
+  '#c6e0fb', '#d3f3ff', '#e4f8ff', '#f4fcff', '#ffffff',
+  '#1c2534', '#2b3549', '#3a4760', '#4c5d7f',
+  '#3a1a2c', '#512c47', '#673651', '#7a3053', '#93365f', '#b0446e', '#c85a85', '#e07fa3', '#efb3c8',
+  '#5f6390', '#7a7fab', '#959bc6', '#b0b7de', '#cbd2f0', '#8e7aa8', '#a98fb4', '#c4a9c9',
+];
+
+// the glyphs: dot radii in cell widths, or a ramp of characters
+const LEVELS = ASCII ? ' .:-=+*#%@' : ' ·•●';
+const NL = LEVELS.length - 1;
+const RADII = [0, 0.13, 0.25, 0.42];
+// how much of a full dot's light each level gives
+const COVER = ASCII
+  ? [0, 0.08, 0.16, 0.22, 0.3, 0.38, 0.5, 0.66, 0.82, 1]
+  : [0, 0.16, 0.45, 1];
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16 - 0.5);
+
+// --- maths ---------------------------------------------------------------------------
+const clamp = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const smooth = (a, b, v) => { const k = clamp((v - a) / (b - a)); return k * k * (3 - 2 * k); };
+const mix = (a, b, k) => a + (b - a) * k;
+const hex = (s) => [1, 3, 5].map((i) => parseInt(s.slice(i, i + 2), 16) / 255);
+const TAU = Math.PI * 2;
+// a cell's brightness to its dot level, a touch steeper than linear so the dark
+// facade stays sparse and the lit roof and petals fill in
+const LEVEL = new Float32Array(1024).map((_, i) => clamp(Math.pow(i / 1023, 1.35) * 1.15));
+
+function hash(x, y) {
+  let h = Math.imul(x | 0, 0x27d4eb2d) ^ Math.imul(y | 0, 0x165667b1);
+  h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const fx = x - xi, fy = y - yi;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y, oct) {
+  let s = 0, n = 0, amp = 0.5, f = 1;
+  for (let i = 0; i < oct; i++) { s += amp * noise(x * f, y * f); n += amp; amp *= 0.5; f *= 2.03; }
+  return s / n;
+}
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function cubic(a, b, c, d, t) {
+  const m = 1 - t;
+  const k0 = m * m * m, k1 = 3 * m * m * t, k2 = 3 * m * t * t, k3 = t * t * t;
+  return [a[0] * k0 + b[0] * k1 + c[0] * k2 + d[0] * k3, a[1] * k0 + b[1] * k1 + c[1] * k2 + d[1] * k3];
+}
+
+// the breeze: a steady air with gusts that build and die away
+function gustAt(t) { return smooth(0.52, 0.82, noise(t * 0.055, 11.3)); }
+function windAt(t) { return WIND * (0.25 + 0.25 * noise(t * 0.21, 4.1) + 0.85 * gustAt(t)); }
+
+// --- colours -------------------------------------------------------------------------
+const PAL = PALETTE.map(hex);
+const C = {
+  facade: hex('#171e2c'), facadeLit: hex('#232c40'), pillar: hex('#0c111b'),
+  roof: hex('#a8c6f6'), roofShade: hex('#46567a'), eave: hex('#283146'),
+  bokeh: hex('#bfcdf2'), bokehPink: hex('#c9aed0'),
+  bark: hex('#090d16'), barkMid: hex('#26314a'), rim: hex('#9ab2e6'), dew: hex('#b7d3fd'),
+  petal: hex('#d6f1ff'), petalShade: hex('#8ea6d8'), crimson: hex('#b0446e'), crimsonDeep: hex('#6a2a4a'),
+  bud: hex('#e9cbdc'), white: [1, 1, 1], petalPink: hex('#ecd3e2'),
+};
+
+// nearest palette colour, cached on a 6-bit cube
+const near = new Int16Array(1 << 18).fill(-1);
+function nearest(r, g, b) {
+  const key = (((r * 63 + 0.5) | 0) << 12) | (((g * 63 + 0.5) | 0) << 6) | ((b * 63 + 0.5) | 0);
+  let i = near[key];
+  if (i >= 0) return i;
+  let best = 1e9;
+  for (let j = 0; j < PAL.length; j++) {
+    const p = PAL[j];
+    const rm = (r + p[0]) / 2;
+    const dr = r - p[0], dg = g - p[1], db = b - p[2];
+    const d = (2 + rm) * dr * dr + 4 * dg * dg + (3 - rm) * db * db;
+    if (d < best) { best = d; i = j; }
+  }
+  near[key] = i;
+  return i;
+}
+
+// --- the grid --------------------------------------------------------------------------
+const canvas = document.getElementById('wall');
+const ctx = canvas.getContext('2d');
+let cols = 0, rows = 0, N = 0, px = 0;
+let R, G, B, bgR, bgG, bgB, mistK, out, prev, atlas, DITHER;
+let SD, LT, AL, AC, LF, touched, nTouched, MN, MC;
+const MS = 3; // the mist lattice's spacing, in cells
+let scene = null;
+
+function layout() {
+  const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+  px = Math.max(2, Math.round(CELL * dpr));
+  cols = Math.ceil((window.innerWidth * dpr) / px);
+  rows = Math.ceil((window.innerHeight * dpr) / px);
+  N = cols * rows;
+  canvas.width = cols * px;
+  canvas.height = rows * px;
+  canvas.style.width = (cols * px) / dpr + 'px';
+  canvas.style.height = (rows * px) / dpr + 'px';
+  R = new Float32Array(N); G = new Float32Array(N); B = new Float32Array(N);
+  bgR = new Float32Array(N); bgG = new Float32Array(N); bgB = new Float32Array(N);
+  mistK = new Float32Array(N);
+  // ordered dither, roughened with a little noise so flat areas don't read as a mesh
+  DITHER = new Float32Array(N);
+  for (let k = 0; k < N; k++) {
+    const c = k % cols, r = (k / cols) | 0;
+    DITHER[k] = 0.62 * BAYER[(r & 3) * 4 + (c & 3)] + 0.36 * (hash(c * 7 + 3, r * 13 + 1) - 0.5);
+  }
+  out = new Uint16Array(N);
+  prev = new Uint16Array(N).fill(0xffff);
+  SD = new Float32Array(N).fill(1e9); LT = new Float32Array(N); AL = new Float32Array(N); AC = new Float32Array(N);
+  LF = new Float32Array(N);
+  touched = new Int32Array(N); nTouched = 0;
+  MN = new Float32Array((Math.ceil(cols / MS) + 3) * (Math.ceil(rows / MS) + 3));
+  MC = new Float32Array(MN.length);
+  buildAtlas();
+  buildBackground();
+  scene = buildScene();
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+// each (level, colour) drawn once, then copied into cells
+function buildAtlas() {
+  atlas = document.createElement('canvas');
+  atlas.width = PAL.length * px;
+  atlas.height = NL * px;
+  const a = atlas.getContext('2d');
+  a.textAlign = 'center';
+  a.textBaseline = 'middle';
+  a.font = `${Math.round(px * 1.05)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  for (let s = 1; s <= NL; s++) {
+    for (let i = 0; i < PAL.length; i++) {
+      a.fillStyle = PALETTE[i];
+      const cx = i * px + px / 2, cy = (s - 1) * px + px / 2;
+      if (ASCII) {
+        a.fillText(LEVELS[s], cx, cy);
+      } else {
+        a.beginPath();
+        a.arc(cx, cy, Math.max(0.6, RADII[s] * px), 0, TAU);
+        a.fill();
+      }
+    }
+  }
+}
+
+// --- the still background: roof, eaves and facade, all out of focus -------------------
+function buildBackground() {
+  const H = rows;
+  const pillars = [0.085, 0.265, 0.515, 0.755, 0.965];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c;
+      const x = c + 0.5, y = r + 0.5;
+      const u = x / cols, v = y / rows;
+      const ev = 0.205 + 0.06 * u + 0.012 * Math.sin(u * 5.1); // the eave line
+      // the facade: dark wood, lit a little from the roof, pillars darker
+      let col = C.facade.slice();
+      let lift = 0.5 * Math.exp(-Math.max(0, v - ev) / 0.09);
+      for (const pu of pillars) {
+        const d = (u - pu) * cols / H;
+        lift -= 0.55 * Math.exp(-((d / 0.018) ** 2)) * smooth(ev, ev + 0.05, v);
+        lift += 0.35 * Math.exp(-(((d - 0.022) / 0.006) ** 2)) * smooth(ev, ev + 0.08, v);
+      }
+      lift += 0.18 * (fbm(x * 0.06, y * 0.03, 2) - 0.5);
+      // a beam across under the eaves, and the lattice of a window between pillars
+      lift += 0.25 * Math.exp(-(((v - ev - 0.11) / 0.008) ** 2));
+      for (let j = 0; j < 3; j++) col[j] = mix(C.facade[j], C.facadeLit[j], clamp(0.5 + lift)) * (0.6 + 0.8 * clamp(0.5 + lift));
+      // the tile ends hanging under the eave line, a row of round caps
+      const per = H * 0.036;
+      const fx = (x / per) % 1 - 0.5;
+      const cd = Math.hypot(fx * per, y - (ev + 0.004) * H) / (H * 0.0145);
+      const cap = 1 - smooth(0.6, 1.0, cd);
+      // the roof: in shade to the left, lit to the right, tile channels running down it
+      const roofM = Math.max(1 - smooth(ev - 0.008, ev + 0.002, v), cap);
+      const under = 1 - roofM;
+      const lit = smooth(0.18, 0.62, u) * (1 - 0.12 * smooth(0.82, 1, u));
+      const channels = 0.8 + 0.2 * Math.pow(0.5 + 0.5 * Math.cos(((x - y * 0.18) / (H * 0.032)) * TAU), 0.6);
+      const roofK = (0.62 + 0.38 * clamp(v / ev)) * mix(channels, 1.06, cap);
+      for (let j = 0; j < 3; j++) {
+        const roofCol = mix(C.roofShade[j], C.roof[j], lit) * roofK;
+        let v0 = mix(roofCol, col[j], under);
+        // the shadow straight under the tiles
+        v0 *= 1 - 0.75 * under * Math.exp(-Math.max(0, v - ev - 0.012) / 0.025);
+        col[j] = v0;
+      }
+      // glow of the lit roof carried down into the air
+      const glow = 0.1 * lit * Math.exp(-Math.max(0, v - ev) / 0.05) * under;
+      // a vignette, heavier in the lower left
+      const vg = 1 - 0.45 * smooth(0.35, 1.25, Math.hypot((u - 0.62) * 1.2, (v - 0.3) * 1.1));
+      bgR[k] = (col[0] + glow * C.roof[0]) * vg;
+      bgG[k] = (col[1] + glow * C.roof[1]) * vg;
+      bgB[k] = (col[2] + glow * C.roof[2]) * vg;
+      // mist hangs over the facade, cloud shadow moves over the roof
+      mistK[k] = under;
+    }
+  }
+}
+
+// --- the scene: a branch, its sprays and blossoms ------------------------------------
+function buildScene() {
+  const rand = rng(SEED);
+  const H = rows;
+  const P = (u, v) => [u * cols, v * rows];
+
+  // the main branch's spine, top left to the right edge
+  const knots = [0.115, 0.2, 0.285, 0.315, 0.46, 0.565, 0.655, 0.755];
+  const c0 = P(-0.05, 0.015), c1 = P(0.3, 0.262), c2 = P(0.66, 0.552), c3 = P(1.05, 0.82);
+  const spine = [];
+  const NS = Math.max(48, Math.round(cols / 2));
+  let len = 0;
+  for (let i = 0; i <= NS; i++) {
+    const s = i / NS;
+    const [x, y] = cubic(c0, c1, c2, c3, s);
+    if (i) len += Math.hypot(x - spine[i - 1].x, y - spine[i - 1].y);
+    let r = H * mix(0.026, 0.0165, s) * (1 + 0.22 * (noise(s * 13, 3.7) - 0.5));
+    for (const kn of knots) r *= 1 + 0.22 * Math.exp(-(((s - kn) / 0.012) ** 2));
+    spine.push({ s, x, y, r, len });
+  }
+
+  // sprays: twigs off the branch (or spurs on it) carrying blossoms.
+  // [where on the branch, tip offset in screen heights, blossoms, spread, kind]
+  const SPRAYS = [
+    [0.115, [0.004, -0.055], 4, 0.045, 'spur'],
+    [0.285, [-0.006, -0.17], 7, 0.035, 'up'],
+    [0.2, [-0.05, 0.14], 5, 0.045, 'hang'],
+    [0.315, [0.006, 0.045], 3, 0.028, 'spur'],
+    [0.46, [-0.04, 0.12], 5, 0.045, 'hang'],
+    [0.565, [0.002, 0.035], 3, 0.022, 'buds'],
+    [0.655, [-0.008, -0.13], 8, 0.055, 'up'],
+    [0.755, [0.01, -0.055], 4, 0.045, 'spur'],
+    [0.665, [-0.015, 0.24], 5, 0.048, 'hang'],
+    [0.86, [0.004, 0.04], 3, 0.024, 'buds'],
+    [0.055, [0, 0], 4, 0.04, 'fork'],
+  ];
+  const twigs = [], flowers = [];
+  const at = (s) => {
+    const f = s * NS, i = Math.min(NS - 1, Math.floor(f)), k = f - i;
+    const a = spine[i], b = spine[i + 1];
+    return [mix(a.x, b.x, k), mix(a.y, b.y, k), mix(a.r, b.r, k)];
+  };
+  const place = (list, x, y, R, minGap) => {
+    for (const f of list) if (Math.hypot(f.x - x, f.y - y) < (f.R + R) * minGap) return false;
+    return true;
+  };
+
+  for (const [s, tip, n, spread, kind] of SPRAYS) {
+    const [ax, ay, ar] = at(s);
+    let tx = tip[0] * H, ty = tip[1] * H;
+    if (kind === 'fork') {
+      // the fork near the left edge, heading down out of frame
+      const e = P(-0.02, 0.3);
+      tx = e[0] - ax; ty = e[1] - ay;
+    }
+    // the twig: a bent line from the branch to its tip, as offsets from where it joins
+    const tl = Math.hypot(tx, ty) || 1;
+    const nx = -ty / tl, ny = tx / tl;
+    const bend = (rand() - 0.5) * 0.25 * tl;
+    const pts = [];
+    for (let i = 0; i <= 4; i++) {
+      const k = i / 4;
+      const b = Math.sin(k * Math.PI) * bend;
+      pts.push([tx * k + nx * b, ty * k + ny * b]);
+    }
+    const twig = {
+      s, pts, r0: Math.min(ar * 0.55, H * (kind === 'fork' ? 0.014 : 0.0075)), r1: H * 0.0035,
+      swing: kind === 'hang' ? 0.07 : kind === 'up' ? 0.035 : kind === 'fork' ? 0.01 : 0.02,
+      ph: rand() * TAU, f: 0.8 + rand() * 0.6,
+    };
+    const ti = twigs.push(twig) - 1;
+    // blossoms along the twig's outer part, or bunched round a spur
+    const mine = [];
+    for (let tries = 0; mine.length < n && tries < 400; tries++) {
+      const first = mine.length === 0;
+      const type = kind === 'buds' ? (rand() < 0.75 ? 'bud' : 'side')
+        : first ? 'open' : rand() < 0.55 ? 'open' : rand() < 0.5 ? 'side' : 'bud';
+      const R = H * (type === 'open' ? 0.034 + 0.012 * rand() : type === 'side' ? 0.026 + 0.008 * rand() : 0.013 + 0.006 * rand());
+      const k = kind === 'up' ? 0.25 + 0.75 * rand() : kind === 'hang' || kind === 'fork' ? 0.55 + 0.45 * rand() : 0.6 + 0.4 * rand();
+      const i = Math.min(3, Math.floor(k * 4)), kk = k * 4 - i;
+      const bx = mix(pts[i][0], pts[i + 1][0], kk), by = mix(pts[i][1], pts[i + 1][1], kk);
+      const ang = rand() * TAU, rad = Math.sqrt(rand()) * spread * H;
+      const ox = bx + Math.cos(ang) * rad, oy = by + Math.sin(ang) * rad * 0.8;
+      if (!place(mine, ox, oy, R, first ? 0 : 0.82)) continue;
+      mine.push({
+        twig: ti, k, x: ox, y: oy, R, type,
+        rot: rand() * TAU, tilt: type === 'open' ? 0.62 + 0.38 * rand() : 0.42 + 0.15 * rand(),
+        tdir: rand() * TAU, shade: 0.82 + 0.18 * rand(), ph: rand() * TAU, f: 1.6 + rand() * 1.4,
+        // the side its stalk is on, for the calyx of a flower seen side-on
+        stalk: Math.atan2(by - oy, bx - ox), depth: rand(),
+      });
+    }
+    flowers.push(...mine);
+  }
+
+  // a second spray coming in at the top right corner
+  const tr0 = P(0.84, -0.06), tr1 = P(0.95, 0.06), tr2 = P(1.06, 0.15);
+  const corner = { pts: [] };
+  for (let i = 0; i <= 8; i++) corner.pts.push(cubic(tr0, tr1, tr1, tr2, i / 8));
+  for (const [u, v, type, Rf] of [[0.875, 0.03, 'open', 0.034], [0.925, 0.075, 'open', 0.036], [0.965, 0.035, 'side', 0.026], [0.995, 0.11, 'open', 0.032], [0.9, 0.105, 'bud', 0.014], [0.945, 0.0, 'bud', 0.014]]) {
+    const [x, y] = P(u, v);
+    flowers.push({
+      twig: -2, x, y, R: Rf * H, type, rot: rand() * TAU, tilt: type === 'open' ? 0.7 + 0.3 * rand() : 0.5,
+      tdir: rand() * TAU, shade: 0.85 + 0.15 * rand(), ph: rand() * TAU, f: 1.4 + rand(), stalk: -1.2, depth: rand(),
+    });
+  }
+  flowers.sort((a, b) => a.depth - b.depth);
+
+  // dew on the bark: points along the branch, a few of them glinting
+  const dew = [];
+  const nDew = Math.round(len / 1.1);
+  for (let i = 0; i < nDew; i++) {
+    const glint = rand() < 0.3;
+    dew.push({ s: rand(), across: (rand() * 2 - 1) * 0.85, glint, rate: 0.25 + rand() * 0.7, ph: rand() * TAU });
+  }
+
+  // out-of-focus blossoms on a tree further back: [u, v, radius, brightness, pink]
+  const BOKEH = [
+    [0.43, 0.06, 0.05, 0.5, 0], [0.455, 0.15, 0.045, 0.42, 0.3], [0.475, 0.25, 0.05, 0.55, 0], [0.44, 0.335, 0.04, 0.38, 0.5],
+    [0.505, 0.38, 0.05, 0.5, 0.2], [0.535, 0.455, 0.045, 0.45, 0], [0.565, 0.505, 0.04, 0.48, 0.4], [0.525, 0.585, 0.05, 0.38, 0],
+    [0.585, 0.655, 0.045, 0.34, 0.3], [0.555, 0.73, 0.04, 0.3, 0], [0.605, 0.8, 0.035, 0.24, 0.2], [0.49, 0.63, 0.03, 0.25, 0],
+    [0.905, 0.56, 0.05, 0.4, 0.2], [0.955, 0.605, 0.04, 0.35, 0], [0.87, 0.63, 0.035, 0.3, 0.4], [0.99, 0.66, 0.035, 0.28, 0],
+    [0.3, 0.975, 0.04, 0.3, 0], [0.34, 0.95, 0.03, 0.25, 0.3], [0.07, 0.62, 0.035, 0.16, 0], [0.2, 0.86, 0.03, 0.12, 0],
+    [0.36, 0.17, 0.035, 0.22, 0], [0.62, 0.12, 0.04, 0.25, 0],
+  ].map(([u, v, r, b, p]) => ({ x: u * cols, y: v * rows, r: r * H, b: Math.min(0.8, b * 1.4), p, ph: rand() * TAU }));
+
+  return { spine, NS, len, twigs, flowers, corner, dew, bokeh: BOKEH, petals: [], spawn: 0 };
+}
+
+// --- drawing into the shading buffers ------------------------------------------------
+
+// blend a colour over a cell
+function over(k, col, a) {
+  if (a <= 0) return;
+  if (a > 1) a = 1;
+  R[k] += (col[0] - R[k]) * a; G[k] += (col[1] - G[k]) * a; B[k] += (col[2] - B[k]) * a;
+}
+function add(k, col, a) { R[k] += col[0] * a; G[k] += col[1] * a; B[k] += col[2] * a; }
+// the same, for a colour in three numbers (keeps the hot loops from allocating)
+function over3(k, r, g, b, a) {
+  if (a <= 0) return;
+  if (a > 1) a = 1;
+  R[k] += (r - R[k]) * a; G[k] += (g - G[k]) * a; B[k] += (b - B[k]) * a;
+}
+
+// a soft round splat (petals, dew, glints)
+function splat(x, y, rad, col, a, additive) {
+  const x0 = Math.max(0, Math.floor(x - rad - 1)), x1 = Math.min(cols - 1, Math.floor(x + rad + 1));
+  const y0 = Math.max(0, Math.floor(y - rad - 1)), y1 = Math.min(rows - 1, Math.floor(y + rad + 1));
+  for (let r = y0; r <= y1; r++) {
+    for (let c = x0; c <= x1; c++) {
+      const d = Math.hypot(c + 0.5 - x, r + 0.5 - y);
+      const cov = clamp(rad + 0.5 - d) * a;
+      if (cov <= 0) continue;
+      if (additive) add(r * cols + c, col, cov); else over(r * cols + c, col, cov);
+    }
+  }
+}
+
+// a tapered segment of bark into the distance buffers: keep the nearest
+function barkSegment(ax, ay, ar, bx, by, br, along0, along1, lift = 0) {
+  const pad = Math.max(ar, br) + 1.5;
+  const x0 = Math.max(0, Math.floor(Math.min(ax, bx) - pad)), x1 = Math.min(cols - 1, Math.ceil(Math.max(ax, bx) + pad));
+  const y0 = Math.max(0, Math.floor(Math.min(ay, by) - pad)), y1 = Math.min(rows - 1, Math.ceil(Math.max(ay, by) + pad));
+  const dx = bx - ax, dy = by - ay, ll = dx * dx + dy * dy || 1;
+  for (let r = y0; r <= y1; r++) {
+    for (let c = x0; c <= x1; c++) {
+      const px0 = c + 0.5 - ax, py0 = r + 0.5 - ay;
+      const t = clamp((px0 * dx + py0 * dy) / ll);
+      const ex = px0 - dx * t, ey = py0 - dy * t;
+      const d = Math.hypot(ex, ey);
+      const rad = ar + (br - ar) * t;
+      const sd = d - rad;
+      if (sd > 1) continue;
+      const k = r * cols + c;
+      if (SD[k] > 1e8) touched[nTouched++] = k;
+      if (sd < SD[k]) {
+        SD[k] = sd;
+        // light from the upper right: the normal's lean toward it
+        const n = d > 1e-4 ? (ex * 0.41 - ey * 0.91) / d : 0;
+        LT[k] = n * (1 - lift) + lift;
+        AL[k] = along0 + (along1 - along0) * t;
+        AC[k] = d / Math.max(0.5, rad) * Math.sign(ex * -dy + ey * dx || 1);
+      }
+    }
+  }
+}
+
+function resolveBark() {
+  for (let i = 0; i < nTouched; i++) {
+    const k = touched[i];
+    const sd = SD[k];
+    const a = clamp(0.5 - sd);
+    if (a > 0) {
+      const n = LT[k];
+      const grain = noise(AL[k] * 0.35, AC[k] * 1.6 + 7);
+      // lit along the top from the roof, a fainter edge of light underneath
+      const rim = Math.pow(Math.max(0, n), 2) * smooth(-2.4, -0.2, sd);
+      const under = Math.pow(Math.max(0, -n), 2) * smooth(-1.3, -0.1, sd) * 0.3;
+      const g = 0.3 * grain, l = rim * 0.85 + under;
+      over3(k, mix(C.bark[0], C.barkMid[0], g) + C.rim[0] * l, mix(C.bark[1], C.barkMid[1], g) + C.rim[1] * l,
+        mix(C.bark[2], C.barkMid[2], g) + C.rim[2] * l, a);
+    }
+    SD[k] = 1e9;
+  }
+  nTouched = 0;
+}
+
+// a five-petalled blossom, a flower seen side-on, or a bud
+function flower(f, x, y) {
+  const R0 = f.R;
+  const x0 = Math.max(0, Math.floor(x - R0 * 1.3 - 1)), x1 = Math.min(cols - 1, Math.ceil(x + R0 * 1.3 + 1));
+  const y0 = Math.max(0, Math.floor(y - R0 * 1.3 - 1)), y1 = Math.min(rows - 1, Math.ceil(y + R0 * 1.3 + 1));
+  const ct = Math.cos(f.tdir), st = Math.sin(f.tdir);
+  const cs = Math.cos(f.stalk), ss = Math.sin(f.stalk);
+  const pd = 0.57 * R0, pr = 0.45 * R0;
+  const petals = [];
+  for (let i = 0; i < 5; i++) petals.push([Math.cos(f.rot + (i * TAU) / 5) * pd, Math.sin(f.rot + (i * TAU) / 5) * pd]);
+  for (let r = y0; r <= y1; r++) {
+    for (let c = x0; c <= x1; c++) {
+      const dx = c + 0.5 - x, dy = r + 0.5 - y;
+      const k = r * cols + c;
+      if (f.type === 'bud') {
+        // an egg, pink-white, held in a raspberry calyx on the stalk's side
+        const qa = dx * cs + dy * ss, qb = -dx * ss + dy * cs; // qa toward the stalk
+        const sd = Math.hypot(qa / 1.0, qb / 0.82) - R0;
+        const a = clamp(0.5 - sd);
+        if (a <= 0) continue;
+        const base = smooth(-0.2 * R0, 0.55 * R0, qa);
+        const hl = clamp(0.5 - (dx * 0.41 - dy * 0.91) / R0 * 0.5);
+        const h = 0.75 + 0.3 * hl;
+        over3(k, mix(C.bud[0] * h, C.crimson[0], base) * f.shade, mix(C.bud[1] * h, C.crimson[1], base) * f.shade,
+          mix(C.bud[2] * h, C.crimson[2], base) * f.shade, a);
+        continue;
+      }
+      // into the flower's tilted frame
+      const qx = dx * ct + dy * st, qy = (-dx * st + dy * ct) / f.tilt;
+      let sd = 1e9, inside = 0;
+      for (let i = 0; i < 5; i++) {
+        const e = Math.hypot(qx - petals[i][0], qy - petals[i][1]) - pr;
+        if (e < sd) sd = e;
+        if (e < 0) inside++;
+      }
+      sd *= f.tilt * 0.5 + 0.5;
+      const dist = Math.hypot(qx, qy);
+      // the calyx: behind the petals of a flower seen side-on, on its stalk's side
+      if (f.type === 'side') {
+        const qa = dx * cs + dy * ss, qb = -dx * ss + dy * cs;
+        const cd = Math.hypot((qa - 0.7 * R0) / 0.55, qb / 0.75) - 0.42 * R0;
+        over(k, C.crimson, clamp(0.5 - cd) * 0.95 * f.shade);
+      }
+      const a = clamp(0.5 - sd);
+      if (a <= 0) continue;
+      // brighter toward the petal tips and on the side facing the light, a
+      // little shadow where petals overlap and round the centre
+      const lit = 0.84 + 0.16 * clamp(0.5 - (dx * 0.41 - dy * 0.91) / R0);
+      const tip = 0.72 + 0.28 * smooth(0.15 * R0, 0.85 * R0, dist);
+      const lap = inside > 1 ? 0.74 : 1;
+      const b = lit * tip * lap * f.shade;
+      const m = 0.75 + 0.25 * b;
+      over3(k, mix(C.petalShade[0], C.petal[0], b) * m, mix(C.petalShade[1], C.petal[1], b) * m, mix(C.petalShade[2], C.petal[2], b) * m, a);
+      // the heart: raspberry with pale stamens round it
+      if (f.type === 'open') {
+        const heart = clamp(0.5 - (dist - 0.24 * R0));
+        if (heart > 0) over(k, C.crimson, heart * 0.95);
+        const ring = Math.exp(-(((dist - 0.42 * R0) / (0.09 * R0 + 0.35)) ** 2)) * 0.35;
+        if (ring > 0.01) over(k, C.petalPink, ring);
+      }
+    }
+  }
+}
+
+// --- one frame ----------------------------------------------------------------------
+let lastT = 0;
+function render(t, paint = true) {
+  const dt = Math.min(0.2, Math.max(0, t - lastT));
+  lastT = t;
+  const H = rows;
+  const wind = windAt(t), gust = gustAt(t);
+  const sc = scene;
+
+  // the background, with mist drifting over the facade and cloud over the roof.
+  // Both are soft, so they're worked out on a coarse lattice and blended between.
+  const mc = Math.ceil(cols / MS) + 2, mr = Math.ceil(rows / MS) + 2;
+  for (let j = 0; j < mr; j++) {
+    for (let i = 0; i < mc; i++) {
+      const c = i * MS, r = j * MS;
+      MN[j * mc + i] = noise(c * 0.045 - t * 0.09, r * 0.08 + t * 0.012) * 0.6 + noise(c * 0.11 - t * 0.21, r * 0.19) * 0.4;
+      MC[j * mc + i] = 0.86 + 0.28 * noise(c * 0.02 - t * 0.025, r * 0.03 + 5);
+    }
+  }
+  for (let r = 0; r < rows; r++) {
+    const j = (r / MS) | 0, fy = r / MS - j;
+    for (let c = 0; c < cols; c++) {
+      const i = (c / MS) | 0, fx = c / MS - i;
+      const q = j * mc + i;
+      const n = mix(mix(MN[q], MN[q + 1], fx), mix(MN[q + mc], MN[q + mc + 1], fx), fy);
+      const cl = mix(mix(MC[q], MC[q + 1], fx), mix(MC[q + mc], MC[q + mc + 1], fx), fy);
+      const k = r * cols + c;
+      const m = mistK[k];
+      const f = mix(cl, 0.62 + 0.75 * n, m);
+      R[k] = bgR[k] * f + m * n * 0.018;
+      G[k] = bgG[k] * f + m * n * 0.022;
+      B[k] = bgB[k] * f + m * n * 0.034;
+    }
+  }
+
+  // blossoms further back, out of focus, swaying a little
+  for (const b of sc.bokeh) {
+    const bx = b.x + Math.sin(t * 0.4 + b.ph) * 0.6 * (0.5 + wind), by = b.y + Math.cos(t * 0.33 + b.ph) * 0.3;
+    const br = b.r * (1 + 0.04 * Math.sin(t * 0.5 + b.ph));
+    const col = [0, 1, 2].map((j) => mix(C.bokeh[j], C.bokehPink[j], b.p));
+    const x0 = Math.max(0, Math.floor(bx - br - 1)), x1 = Math.min(cols - 1, Math.ceil(bx + br + 1));
+    const y0 = Math.max(0, Math.floor(by - br - 1)), y1 = Math.min(rows - 1, Math.ceil(by + br + 1));
+    for (let r = y0; r <= y1; r++) {
+      for (let c = x0; c <= x1; c++) {
+        const d = Math.hypot(c + 0.5 - bx, r + 0.5 - by) / br;
+        const a = (1 - smooth(0.45, 1, d)) * b.b * (0.9 + 0.1 * Math.sin(t * 0.7 + b.ph));
+        if (a > 0) over(r * cols + c, col, a);
+      }
+    }
+  }
+
+  // the branch bends with the breeze, more toward its far end
+  const sp = sc.spine;
+  const live = new Array(sp.length);
+  const swayA = H * 0.011 * wind, osc = H * 0.003, flut = H * 0.0018 * (0.3 + gust);
+  for (let i = 0; i < sp.length; i++) {
+    const p = sp[i];
+    const bendK = Math.pow(p.s, 1.6);
+    const dy = bendK * (swayA + osc * Math.sin(t * 0.83 + p.s * 1.7) + flut * Math.sin(t * 3.1 + p.s * 9));
+    live[i] = [p.x - dy * 0.3, p.y + dy, p.r];
+  }
+  const liveAt = (s) => {
+    const f = s * sc.NS, i = Math.max(0, Math.min(sc.NS - 1, Math.floor(f))), k = f - i;
+    const a = live[i], b = live[i + 1];
+    return [mix(a[0], b[0], k), mix(a[1], b[1], k), mix(a[2], b[2], k)];
+  };
+
+  // the twigs swing about where they join
+  const twigPts = sc.twigs.map((tw) => {
+    const [ax, ay] = liveAt(tw.s);
+    const th = tw.swing * (0.35 + wind) * Math.sin(t * tw.f + tw.ph) + tw.swing * 0.5 * wind;
+    const co = Math.cos(th), si = Math.sin(th);
+    return { ax, ay, co, si, pts: tw.pts.map(([x, y]) => [ax + x * co - y * si, ay + x * si + y * co]) };
+  });
+
+  // flowers behind the bark first
+  const flowerAt = (f) => {
+    let x, y;
+    if (f.twig === -2) {
+      const sw = H * 0.004 * (0.4 + wind) * Math.sin(t * 0.9 + 1.3);
+      x = f.x + sw; y = f.y + sw * 0.4;
+    } else {
+      const tp = twigPts[f.twig];
+      x = tp.ax + f.x * tp.co - f.y * tp.si;
+      y = tp.ay + f.x * tp.si + f.y * tp.co;
+    }
+    const fl = 0.12 * (0.4 + wind) * Math.sin(t * f.f + f.ph);
+    return [x + fl, y + fl * 0.6];
+  };
+  for (const f of sc.flowers) if (f.depth < 0.15) { const [x, y] = flowerAt(f); flower(f, x, y); }
+
+  // bark: the branch, its twigs, the corner spray
+  for (let i = 0; i < sp.length - 1; i++) {
+    const a = live[i], b = live[i + 1];
+    barkSegment(a[0], a[1], a[2], b[0], b[1], b[2], sp[i].len, sp[i + 1].len);
+  }
+  for (let j = 0; j < sc.twigs.length; j++) {
+    const tw = sc.twigs[j], tp = twigPts[j];
+    for (let i = 0; i < tp.pts.length - 1; i++) {
+      const k0 = i / (tp.pts.length - 1), k1 = (i + 1) / (tp.pts.length - 1);
+      barkSegment(tp.pts[i][0], tp.pts[i][1], mix(tw.r0, tw.r1, k0), tp.pts[i + 1][0], tp.pts[i + 1][1], mix(tw.r0, tw.r1, k1), j * 50 + k0 * 9, j * 50 + k1 * 9, 0.45);
+    }
+  }
+  const cp = sc.corner.pts;
+  const csw = H * 0.004 * (0.4 + wind) * Math.sin(t * 0.9 + 1.3);
+  for (let i = 0; i < cp.length - 1; i++) {
+    const k0 = i / (cp.length - 1), k1 = (i + 1) / (cp.length - 1);
+    barkSegment(cp[i][0] + csw * k0, cp[i][1], H * mix(0.011, 0.006, k0), cp[i + 1][0] + csw * k1, cp[i + 1][1], H * mix(0.011, 0.006, k1), 900 + k0 * 30, 900 + k1 * 30, 0.3);
+  }
+  resolveBark();
+
+  // dew on the bark, some of it catching the light
+  for (const d of sc.dew) {
+    const [x, y, r] = liveAt(d.s);
+    // across the branch: perpendicular to it, roughly up and to the right
+    const nx = 0.45, ny = -0.89;
+    const ex = x + nx * d.across * r, ey = y + ny * d.across * r;
+    splat(ex, ey, 0.3, C.dew, 0.75 + 0.25 * (d.across > 0 ? d.across : 0), false);
+    if (d.glint) {
+      const g = Math.pow(Math.max(0, Math.sin(t * d.rate + d.ph)), 18);
+      if (g > 0.02) {
+        splat(ex, ey, 0.4 + 0.7 * g, C.white, 1.2 * g, true);
+        if (g > 0.6) for (const [ox, oy] of [[1.3, 0], [-1.3, 0], [0, 1.3], [0, -1.3]]) splat(ex + ox, ey + oy, 0.3, C.petal, 0.5 * (g - 0.6), true);
+      }
+    }
+  }
+
+  // the rest of the blossoms
+  for (const f of sc.flowers) if (f.depth >= 0.15) { const [x, y] = flowerAt(f); flower(f, x, y); }
+
+  // petals: let go by open flowers, more in a gust, or blown in from trees out of frame
+  const ps = sc.petals;
+  const maxP = Math.round(90 * PETALS * Math.max(1, (cols * rows) / 23000));
+  sc.spawn += dt * PETALS * (1.1 + 7 * gust * WIND) * Math.max(0.6, cols / 190);
+  while (sc.spawn >= 1) {
+    sc.spawn -= 1;
+    if (ps.length >= maxP) continue;
+    const z = Math.random() < 0.12 ? 1.6 + Math.random() * 0.8 : 0.35 + Math.random() * 0.75;
+    let x, y;
+    const opens = sc.flowers.filter((f) => f.type === 'open');
+    if (Math.random() < 0.6 && opens.length) {
+      const f = opens[(Math.random() * opens.length) | 0];
+      [x, y] = flowerAt(f);
+      x += (Math.random() - 0.5) * f.R; y += (Math.random() - 0.5) * f.R;
+    } else if (Math.random() < 0.5) {
+      x = -3; y = Math.random() * rows * 0.7;
+    } else {
+      x = (Math.random() * 1.2 - 0.15) * cols; y = -3;
+    }
+    ps.push({ x, y, z, vx: 0, vy: 0, spin: Math.random() * TAU, sr: 1.5 + Math.random() * 3, ph: Math.random() * TAU,
+      size: 0.7 + Math.random() * 0.55, pink: Math.random() < 0.3 ? 0.5 : 0, seed: Math.random() * 100 });
+  }
+  for (let i = ps.length - 1; i >= 0; i--) {
+    const p = ps[i];
+    const tx = noise(p.x * 0.05, t * 0.3 + p.seed) - 0.5, ty = noise(p.seed, t * 0.4 + p.y * 0.05) - 0.5;
+    const push = (2 + 13 * wind) * p.z;
+    p.vx += (push + tx * 8 - p.vx) * Math.min(1, dt * 1.2);
+    p.vy += ((3.5 + 4.5 * p.z) + ty * 5 + Math.sin(t * 2.3 + p.ph) * 2 - p.vy) * Math.min(1, dt * 1.6);
+    p.x += p.vx * dt * (H / 120); p.y += p.vy * dt * (H / 120); p.spin += p.sr * dt;
+    if (p.x > cols + 6 || p.y > rows + 6 || p.x < -12) { ps.splice(i, 1); continue; }
+    const face = Math.abs(Math.cos(p.spin));
+    const near = p.z > 1.3;
+    const rad = p.size * p.z * (0.35 + 0.65 * face) * (near ? 1.4 : 1);
+    const col = [0, 1, 2].map((j) => mix(C.petal[j], C.petalPink[j], p.pink));
+    splat(p.x, p.y, rad, col, (near ? 0.45 : 0.95) * (0.7 + 0.3 * face), false);
+  }
+
+  // --- to dots ----------------------------------------------------------------------
+  const P = PAL.length;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c;
+      const cr = R[k], cg = G[k], cb = B[k];
+      const peak = Math.max(cr, cg, cb);
+      if (peak < 0.004) { out[k] = 0; continue; }
+      const level = LEVEL[Math.min(1023, (peak * 1023 + 0.5) | 0)];
+      const step = Math.max(0, Math.min(NL, Math.round(level * NL + DITHER[k])));
+      if (!step) { out[k] = 0; continue; }
+      const want = clamp((level + 0.02) / COVER[step]);
+      // the dot's colour: the cell's hue, lifted to make up for the dot's size, but
+      // never so far that a dim cell's dots come out bright
+      const s = Math.min(3.2, (0.25 + 0.75 * want) / peak);
+      out[k] = 1 + (step - 1) * P + nearest(clamp(cr * s), clamp(cg * s), clamp(cb * s));
+    }
+  }
+  if (paint) draw();
+}
+
+// copy changed cells from the atlas
+function draw() {
+  const P = PAL.length;
+  ctx.fillStyle = GROUND;
+  for (let k = 0; k < N; k++) {
+    if (out[k] === prev[k]) continue;
+    const c = k % cols, r = (k / cols) | 0;
+    ctx.fillRect(c * px, r * px, px, px);
+  }
+  for (let k = 0; k < N; k++) {
+    const o = out[k];
+    if (o === prev[k]) continue;
+    prev[k] = o;
+    if (!o) continue;
+    const c = k % cols, r = (k / cols) | 0;
+    const step = 1 + (((o - 1) / P) | 0), ci = (o - 1) % P;
+    ctx.drawImage(atlas, ci * px, (step - 1) * px, px, px, c * px, r * px, px, px);
+  }
+}
+
+// --- run ----------------------------------------------------------------------------
+let resizeTimer = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { layout(); render(clock()); }, 150);
+});
+const t0 = performance.now();
+const clock = () => (performance.now() - t0) / 1000 + (+Q.get('t') || 0);
+layout();
+// let a few petals be in the air already
+for (let i = 0; i < 90; i++) render(clock() - 9 + i * 0.1, false);
+render(clock());
+let last = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (now - last < 1000 / FPS - 4) return;
+  last = now;
+  render(clock());
+}
+if (Q.get('still') !== '1') requestAnimationFrame(loop);
+// for recording previews: draw the frame at a given time
+window.__render = (t) => render(t);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ascii.rest Wallpaper</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #04060d; color: #cdd6f4; }
+  canvas { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+  p { position: fixed; left: 0; right: 0; top: 45%; margin: 0; text-align: center; font: 14px ui-monospace, Menlo, monospace; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<script type="module">
+/*
+ * Any piece from ascii.rest (https://ascii.rest, by @bas3line, MIT licensed),
+ * full screen, to use as a wallpaper:
+ *
+ *   ascii-rest.html?piece=lantern-lake
+ *   ascii-rest.html?piece=tokyo-rain&fps=12
+ *
+ * The name is the one in the piece's ascii.rest address. The piece is scaled
+ * to cover the screen, cropping its edges rather than leaving bars.
+ */
+const VERSION = '0.4.0';
+const Q = new URLSearchParams(location.search);
+const name = Q.get('piece') || 'lantern-lake';
+const canvas = document.getElementById('art');
+
+try {
+  const lib = await import(`https://cdn.jsdelivr.net/npm/ascii.rest@${VERSION}/dist/index.js`);
+  if (!Object.hasOwn(lib.load, name)) throw new Error(`ascii.rest has no piece called "${name}"`);
+  const piece = await lib.load[name]();
+  const { cols = 80, rows = 24, cell = 2, ground } = piece.meta;
+  if (ground) document.body.style.background = ground;
+  // as wide as the window, or wider when the piece is taller than the window
+  const fit = () => { canvas.style.width = Math.max(innerWidth, (innerHeight * cols) / (rows * cell)) + 'px'; };
+  fit();
+  addEventListener('resize', fit);
+  const fps = parseFloat(Q.get('fps'));
+  // motion: a wallpaper should play even with reduced motion set for apps
+  lib.mount(canvas, piece, fps > 0 ? { motion: true, fps } : { motion: true });
+} catch (err) {
+  const p = document.createElement('p');
+  p.textContent = String(err.message || err);
+  document.body.append(p);
+}
+</script>
+</body>
+</html>
