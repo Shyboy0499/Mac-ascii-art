@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swan Lake Mist</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #050906; }
+  canvas { position: fixed; left: 0; top: 0; display: block; }
+</style>
+</head>
+<body>
+<canvas id="wall"></canvas>
+<script>
+/*
+ * swan lake mist: a dark mountain lake under low cloud, in the colours of the
+ * photo it was drawn from. Fog drifts over the forested hills and along the
+ * treeline, a swan glides across the black water with its wake opening out
+ * behind it, a light rain rings the surface, the wind runs through the grass
+ * on the near bank, and now and then a few birds cross under the cloud.
+ *
+ * Drawn the same way as index.html: every cell of a square grid is shaded in
+ * colour, then drawn as a halftone dot whose size is its brightness
+ * (ordered-dithered) and whose colour is the nearest in a palette sampled
+ * from the photo. It's one file on purpose, so it works offline and when
+ * Plash opens it as a local file.
+ *
+ * Options, as URL parameters: lake.html?cell=8&fps=15&rain=1&wind=1&seed=7
+ *   cell    size of a grid cell in screen points (smaller = finer, more CPU)
+ *   fps     frames a second
+ *   rain    how hard it rains (0 for none)
+ *   wind    how strong the wind is over the grass and fog (0 for still air)
+ *   seed    a different treeline
+ *   ramp    dots (default) or ascii, to draw with " .:-=+*#%@" instead
+ *   still   1 to draw one frame and stop (no animation, no CPU)
+ */
+(() => {
+'use strict';
+
+const Q = new URLSearchParams(location.search);
+const opt = (k, d, lo, hi) => {
+  const v = parseFloat(Q.get(k));
+  return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d;
+};
+const CELL = opt('cell', 8, 3, 40);
+const FPS = opt('fps', 15, 1, 60);
+const RAIN = opt('rain', 1, 0, 5);
+const WIND = opt('wind', 1, 0, 4);
+const SEED = opt('seed', 7, 0, 1e9) | 0;
+const ASCII = Q.get('ramp') === 'ascii';
+
+// Sampled from the photo: the greys of the cloud and fog, the near-black
+// greens of the forest and the leafier trees by the shore, the olive of the
+// grass, the black-green water and the sheen on it, and the swan.
+const GROUND = '#050906';
+const PALETTE = [
+  '#2b302f', '#3a403f', '#444b49', '#555c5c', '#646b6c', '#72777a', '#83888c', '#9da1a6', '#adb1b6', '#babec2', '#c9ccd0', '#dadde0',
+  '#0b110c', '#101812', '#151e17', '#1b241c', '#222c22', '#2a3529', '#33403a', '#3f4b45', '#4e5657',
+  '#24331f', '#2d3e24', '#384a2c',
+  '#1c280f', '#243314', '#2b3d18', '#34481d', '#3e5423', '#4a622a', '#56702f',
+  '#0c1712', '#122019', '#19211e', '#22302a', '#2f3d37', '#43514b', '#5c6964', '#7a8682',
+  '#8a8f8a', '#b9bdb8', '#e8ebe7', '#f4f6f2', '#ffffff', '#b8662e',
+];
+
+// the glyphs: dot radii in cell widths, or a ramp of characters
+const LEVELS = ASCII ? ' .:-=+*#%@' : ' ·•●';
+const NL = LEVELS.length - 1;
+const RADII = [0, 0.13, 0.25, 0.42];
+// how much of a full dot's light each level gives
+const COVER = ASCII
+  ? [0, 0.08, 0.16, 0.22, 0.3, 0.38, 0.5, 0.66, 0.82, 1]
+  : [0, 0.16, 0.45, 1];
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16 - 0.5);
+
+// --- maths ---------------------------------------------------------------------------
+const clamp = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const smooth = (a, b, v) => { const k = clamp((v - a) / (b - a)); return k * k * (3 - 2 * k); };
+const mix = (a, b, k) => a + (b - a) * k;
+const hex = (s) => [1, 3, 5].map((i) => parseInt(s.slice(i, i + 2), 16) / 255);
+const TAU = Math.PI * 2;
+// a cell's brightness to its dot level: lifted a little in the darks, so the
+// forest and the grass keep some texture in a photo this dark
+const LEVEL = new Float32Array(1024).map((_, i) => clamp(Math.pow(i / 1023, 1.2) * 1.2));
+
+function hash(x, y) {
+  let h = Math.imul(x | 0, 0x27d4eb2d) ^ Math.imul(y | 0, 0x165667b1);
+  h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const fx = x - xi, fy = y - yi;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y, oct) {
+  let s = 0, n = 0, amp = 0.5, f = 1;
+  for (let i = 0; i < oct; i++) { s += amp * noise(x * f, y * f); n += amp; amp *= 0.5; f *= 2.03; }
+  return s / n;
+}
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const frac = (v) => v - Math.floor(v);
+
+// the wind: a steady air with gusts that build and die away
+function gustAt(t) { return smooth(0.5, 0.8, noise(t * 0.05, 7.7)); }
+function windAt(t) { return WIND * (0.35 + 0.25 * noise(t * 0.19, 2.3) + 0.6 * gustAt(t)); }
+
+// --- colours -------------------------------------------------------------------------
+const PAL = PALETTE.map(hex);
+const C = {
+  sky: hex('#c4c7cb'), skyEdge: hex('#a3a7ac'), fog: hex('#b1b5b9'), fogDeep: hex('#7c8185'),
+  hill: hex('#47504f'), hillFog: hex('#858c8f'),
+  forestBack: hex('#3b4843'), forest: hex('#121b14'), leafy: hex('#293a22'), leafyLit: hex('#4f693a'),
+  bank: hex('#2a3a1c'),
+  water: hex('#050d09'), waterFar: hex('#0d1813'), sheen: hex('#9aa5a1'),
+  grass: hex('#283b15'), grassLit: hex('#57772f'), grassDark: hex('#111a09'),
+  swan: hex('#f3f5f1'), swanShade: hex('#a2a7a2'), beak: hex('#b8662e'),
+  rain: hex('#9da1a6'), bird: hex('#2a2f2f'),
+};
+
+// nearest palette colour, cached on a 6-bit cube
+const near = new Int16Array(1 << 18).fill(-1);
+function nearest(r, g, b) {
+  const key = (((r * 63 + 0.5) | 0) << 12) | (((g * 63 + 0.5) | 0) << 6) | ((b * 63 + 0.5) | 0);
+  let i = near[key];
+  if (i >= 0) return i;
+  let best = 1e9;
+  for (let j = 0; j < PAL.length; j++) {
+    const p = PAL[j];
+    const rm = (r + p[0]) / 2;
+    const dr = r - p[0], dg = g - p[1], db = b - p[2];
+    const d = (2 + rm) * dr * dr + 4 * dg * dg + (3 - rm) * db * db;
+    if (d < best) { best = d; i = j; }
+  }
+  near[key] = i;
+  return i;
+}
+
+// --- the grid --------------------------------------------------------------------------
+const canvas = document.getElementById('wall');
+const ctx = canvas.getContext('2d');
+let cols = 0, rows = 0, N = 0, px = 0;
+let R, G, B, bgR, bgG, bgB, ZONE, FOGK, out, prev, atlas, DITHER, FN;
+const FS = 3; // the fog lattice's spacing, in cells
+let scene = null;
+
+// what each cell shows
+const SKY = 0, HILL = 1, BACK = 2, FRONT = 3, LEAFY = 4, BANK = 5, WATER = 6, GRASS = 7;
+// the far shore and the near one, in screen heights from the top
+const SHORE = 0.5, LAWN = 0.775;
+const lawnAt = (u) => LAWN + 0.004 * Math.sin(u * 9.1) + 0.003 * Math.sin(u * 23.7 + 1);
+
+function layout() {
+  const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+  px = Math.max(2, Math.round(CELL * dpr));
+  cols = Math.ceil((window.innerWidth * dpr) / px);
+  rows = Math.ceil((window.innerHeight * dpr) / px);
+  N = cols * rows;
+  canvas.width = cols * px;
+  canvas.height = rows * px;
+  canvas.style.width = (cols * px) / dpr + 'px';
+  canvas.style.height = (rows * px) / dpr + 'px';
+  R = new Float32Array(N); G = new Float32Array(N); B = new Float32Array(N);
+  bgR = new Float32Array(N); bgG = new Float32Array(N); bgB = new Float32Array(N);
+  ZONE = new Uint8Array(N); FOGK = new Float32Array(N);
+  // ordered dither, roughened with a little noise so flat areas don't read as a mesh
+  DITHER = new Float32Array(N);
+  for (let k = 0; k < N; k++) {
+    const c = k % cols, r = (k / cols) | 0;
+    DITHER[k] = 0.62 * BAYER[(r & 3) * 4 + (c & 3)] + 0.36 * (hash(c * 7 + 3, r * 13 + 1) - 0.5);
+  }
+  out = new Uint16Array(N);
+  prev = new Uint16Array(N).fill(0xffff);
+  FN = new Float32Array((Math.ceil(cols / FS) + 3) * (Math.ceil(rows / FS) + 3));
+  buildAtlas();
+  buildBackground();
+  scene = buildScene();
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+// each (level, colour) drawn once, then copied into cells
+function buildAtlas() {
+  atlas = document.createElement('canvas');
+  atlas.width = PAL.length * px;
+  atlas.height = NL * px;
+  const a = atlas.getContext('2d');
+  a.textAlign = 'center';
+  a.textBaseline = 'middle';
+  a.font = `${Math.round(px * 1.05)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  for (let s = 1; s <= NL; s++) {
+    for (let i = 0; i < PAL.length; i++) {
+      a.fillStyle = PALETTE[i];
+      const cx = i * px + px / 2, cy = (s - 1) * px + px / 2;
+      if (ASCII) {
+        a.fillText(LEVELS[s], cx, cy);
+      } else {
+        a.beginPath();
+        a.arc(cx, cy, Math.max(0.6, RADII[s] * px), 0, TAU);
+        a.fill();
+      }
+    }
+  }
+}
+
+// --- the still background: cloud, hills, forest, shore, water and grass ---------------
+function buildBackground() {
+  const H = rows;
+  const rand = rng(SEED * 7 + 1);
+
+  // A row of spruce as the outline of its tops: in each column, the highest of
+  // its trees' narrow spikes. Rows are in screen rows from the top.
+  const treeRow = (gap, top, spread, slope) => {
+    const sil = new Float32Array(cols).fill(1e9);
+    for (let x = -6; x < cols + 6; x += gap * (0.65 + 0.7 * rand())) {
+      // now and then one stands well clear of its neighbours
+      const tall = rand() < 0.14 ? spread * (0.6 + 0.8 * rand()) : 0;
+      const tip = (top(x / cols) + (rand() - 0.5) * spread - tall) * H;
+      const k = slope * (0.75 + 0.5 * rand());
+      const reach = Math.ceil(H * 0.3 / k);
+      for (let c = Math.max(0, Math.floor(x - reach)); c < Math.min(cols, Math.ceil(x + reach)); c++) {
+        const y = tip + Math.abs(c + 0.5 - x) * k;
+        if (y < sil[c]) sil[c] = y;
+      }
+    }
+    return sil;
+  };
+  // the misty row behind, and the dark row in front with a stand of tall
+  // trees right of centre
+  const back = treeRow(2.1, (u) => 0.235 + 0.06 * (noise(u * 7, 2) - 0.5), 0.04, 3.6);
+  const front = treeRow(2.4, (u) => 0.31 + 0.06 * (noise(u * 6, 5) - 0.5) - 0.06 * Math.exp(-(((u - 0.58) / 0.06) ** 2)) - 0.03 * Math.exp(-(((u - 0.42) / 0.03) ** 2)), 0.06, 3.3);
+
+  // rounded, leafier trees along the shore, in front of the spruce: [u, v, r]
+  const LEAFY_TREES = [
+    [0.305, 0.425, 0.035], [0.335, 0.455, 0.03], [0.38, 0.41, 0.04], [0.415, 0.445, 0.032], [0.455, 0.43, 0.03],
+    [0.4, 0.475, 0.03], [0.285, 0.475, 0.025], [0.5, 0.475, 0.02], [0.58, 0.465, 0.022], [0.615, 0.44, 0.026],
+    [0.64, 0.405, 0.032], [0.665, 0.45, 0.024], [0.71, 0.43, 0.026], [0.12, 0.42, 0.04], [0.155, 0.38, 0.034],
+    [0.09, 0.46, 0.03], [0.175, 0.47, 0.026], [0.24, 0.48, 0.02], [0.955, 0.445, 0.03], [0.905, 0.47, 0.02],
+    [0.79, 0.47, 0.018],
+  ].map(([u, v, r]) => [u * cols, v * H, r * H]);
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c;
+      const x = c + 0.5, y = r + 0.5;
+      const u = x / cols, v = y / rows;
+      let col, zone, fogK;
+
+      // the hills: the left one falls into the valley, the right one climbs to the corner
+      const ridgeL = 0.08 + 0.17 * smooth(0.1, 0.62, u);
+      const ridgeR = 0.25 - 0.24 * Math.pow(clamp((u - 0.68) / 0.3), 0.8);
+      const ridge = Math.min(ridgeL, ridgeR) + 0.008 * (noise(x * 0.9, 1.5) - 0.5) + 0.006 * Math.abs(Math.sin(x * 1.7));
+
+      // leafy trees: how far inside the nearest crown, and how high up it
+      let crown = 0, lift = 0;
+      if (v > 0.3 && v < SHORE) {
+        for (const [tx, ty, tr] of LEAFY_TREES) {
+          const d = Math.hypot(x - tx, (y - ty) * 1.1) / (tr * (0.88 + 0.24 * noise(x * 0.5, y * 0.5)));
+          const a = 1 - smooth(0.85, 1, d);
+          if (a > crown) { crown = a; lift = clamp(0.5 - (y - ty) / tr * 0.5); }
+        }
+      }
+
+      if (v >= lawnAt(u)) {
+        // the near bank: blades of grass, a little lighter close up
+        zone = GRASS; fogK = 0;
+        const blades = noise(x * 0.85, y * 0.16) * 0.6 + noise(x * 2.1, y * 0.35) * 0.4;
+        const near = smooth(LAWN, 1, v);
+        const g = clamp(0.18 + 0.3 * near + 0.55 * (blades - 0.5));
+        col = [0, 1, 2].map((j) => mix(C.grass[j], C.grassLit[j], g));
+        // the lip where it meets the water
+        const lip = 1 - smooth(0, 0.012, v - lawnAt(u));
+        col = col.map((ch, j) => mix(ch, C.grassDark[j], lip * 0.6));
+      } else if (v >= SHORE + 0.004) {
+        // the water: black-green, a little lighter away to the right, darkest
+        // under the far shore where it holds the forest's reflection
+        zone = WATER; fogK = 0;
+        const shade = 0.55 * smooth(0.3, 1, u) * smooth(SHORE, SHORE + 0.08, v);
+        col = [0, 1, 2].map((j) => mix(C.water[j], C.waterFar[j], shade));
+      } else if (v >= SHORE - 0.006) {
+        zone = BANK; fogK = 0;
+        col = C.bank.map((ch) => ch * (0.75 + 0.5 * noise(x * 0.7, 3)));
+      } else if (crown > 0.02) {
+        zone = LEAFY; fogK = 0.05;
+        const leaves = 0.6 + 0.8 * noise(x * 0.55, y * 0.6);
+        const base = [0, 1, 2].map((j) => mix(C.leafy[j], C.leafyLit[j], lift * 0.7) * leaves);
+        // the spruce behind shows at the crown's soft edge
+        col = base.map((ch, j) => mix(C.forest[j], ch, crown));
+      } else if (y >= front[c]) {
+        zone = FRONT;
+        const down = (y - front[c]) / H;
+        fogK = 0.1 * Math.exp(-down / 0.02);
+        const crowns = 0.55 + 0.9 * noise(x * 0.6, y * 0.25);
+        col = C.forest.map((ch) => ch * crowns);
+      } else if (y >= back[c]) {
+        // the row behind, paler in the mist, so the dark spikes in front stand out against it
+        zone = BACK; fogK = 0.65;
+        const crowns = 0.65 + 0.7 * noise(x * 0.55 + 9, y * 0.25);
+        col = C.forestBack.map((ch) => ch * crowns);
+      } else if (v >= ridge) {
+        // forested hillside, fading into the cloud toward its crest
+        zone = HILL; fogK = 0.85;
+        const crowns = 0.75 + 0.5 * noise(x * 0.5, y * 0.7);
+        const misted = smooth(ridge + 0.14, ridge - 0.01, v) * 0.8;
+        // the crest dissolves into the cloud
+        const crest = smooth(ridge + 0.03, ridge, v) * 0.55;
+        col = [0, 1, 2].map((j) => mix(mix(C.hill[j], C.hillFog[j], misted) * crowns, C.skyEdge[j], crest));
+      } else {
+        // overcast sky, brightest in the middle
+        zone = SKY; fogK = 1;
+        const edge = smooth(0.25, 0.75, Math.abs(u - 0.5)) * 0.6 + smooth(0.08, 0, v) * 0.15;
+        col = [0, 1, 2].map((j) => mix(C.sky[j], C.skyEdge[j], edge));
+      }
+      ZONE[k] = zone; FOGK[k] = fogK;
+      bgR[k] = col[0]; bgG[k] = col[1]; bgB[k] = col[2];
+    }
+  }
+}
+
+// --- the things that move ------------------------------------------------------------
+function buildScene() {
+  return { rings: [], spawn: 0 };
+}
+
+// blend a colour over a cell, or add light to it
+function over(k, col, a) {
+  if (a <= 0) return;
+  if (a > 1) a = 1;
+  R[k] += (col[0] - R[k]) * a; G[k] += (col[1] - G[k]) * a; B[k] += (col[2] - B[k]) * a;
+}
+function add(k, col, a) { R[k] += col[0] * a; G[k] += col[1] * a; B[k] += col[2] * a; }
+
+// distance from a point to a segment
+function seg(px0, py0, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const t = clamp(((px0 - ax) * dx + (py0 - ay) * dy) / (dx * dx + dy * dy || 1));
+  return Math.hypot(px0 - ax - dx * t, py0 - ay - dy * t);
+}
+
+// The swan, facing left, as a distance from its outline: x and y in units of
+// its size from the middle of its waterline, negative inside. Also says
+// whether the point is on the shaded underside, the neck, or the beak.
+const NECK = [];
+for (let i = 0; i <= 8; i++) {
+  // an S of a neck: out from the breast, back, and up to the head
+  const t = i / 8;
+  const m = 1 - t;
+  NECK.push([m * m * -2.1 + 2 * m * t * -1.2 + t * t * -2.75, m * m * -1.0 + 2 * m * t * -3.4 + t * t * -4.55]);
+}
+function swanShape(x, y) {
+  // body: a long low oval with the back raised, clipped at the water
+  let d = Math.hypot((x - 0.35) / 3.25, (y + 0.55) / 1.15) - 1;
+  d = Math.min(d, Math.hypot((x - 1.25) / 1.7, (y + 1.25) / 1.0) - 1);
+  // the tail, cocked up at the back
+  d = Math.min(d, Math.hypot((x - 3.25 - (y + 1.0) * 0.6) / 0.85, (y + 1.0) / 0.4) - 1);
+  d *= 1.1;
+  let part = y > -0.5 ? 1 : 0;
+  // the neck, thinning toward the head
+  for (let i = 0; i < NECK.length - 1; i++) {
+    const e = seg(x, y, NECK[i][0], NECK[i][1], NECK[i + 1][0], NECK[i + 1][1]) - mix(0.5, 0.36, i / 8);
+    if (e < d) { d = e; part = 2; }
+  }
+  // the head, and the beak in front of it
+  const h = Math.hypot((x + 3.05) / 0.68, (y + 4.6) / 0.42) - 1;
+  if (h * 0.5 < d) { d = h * 0.5; part = 2; }
+  const b = Math.hypot((x + 3.85) / 0.5, (y + 4.45) / 0.2) - 1;
+  if (b * 0.3 < d) { d = b * 0.3; part = 3; }
+  return [y > 0.05 ? Math.max(d, y - 0.05) : d, part];
+}
+
+// --- one frame ----------------------------------------------------------------------
+let lastT = 0;
+function render(t, paint = true) {
+  const dt = Math.min(0.2, Math.max(0, t - lastT));
+  lastT = t;
+  const H = rows;
+  const wind = windAt(t);
+  const sc = scene;
+  R.set(bgR); G.set(bgG); B.set(bgB);
+
+  // fog: banks of low cloud drifting along the hills and the treeline, worked
+  // out on a coarse lattice and blended between
+  const fogRows = Math.min(rows, Math.ceil(rows * SHORE));
+  const fc = Math.ceil(cols / FS) + 2, fr = Math.ceil(fogRows / FS) + 2;
+  const drift = t * (0.6 + 0.5 * wind);
+  for (let j = 0; j < fr; j++) {
+    for (let i = 0; i < fc; i++) {
+      const c = i * FS, r = j * FS;
+      const big = fbm(c * 0.018 - drift * 0.04, r * 0.045 + 3, 3);
+      const wisp = noise(c * 0.06 - drift * 0.11, r * 0.13 + t * 0.01);
+      FN[j * fc + i] = smooth(0.32, 0.76, big * 0.75 + wisp * 0.35);
+    }
+  }
+  for (let r = 0; r < fogRows; r++) {
+    const v = (r + 0.5) / rows;
+    // thickest along the treeline and in the valley, thinner up in the sky
+    const band = 0.5 + 0.5 * Math.exp(-(((v - 0.2) / 0.09) ** 2));
+    const j = (r / FS) | 0, fy = r / FS - j;
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c;
+      const fk = FOGK[k];
+      if (fk <= 0) continue;
+      const i = (c / FS) | 0, fx = c / FS - i;
+      const q = j * fc + i;
+      const f = mix(mix(FN[q], FN[q + 1], fx), mix(FN[q + fc], FN[q + fc + 1], fx), fy);
+      const valley = 0.5 * Math.exp(-((((c + 0.5) / cols - 0.66) / 0.12) ** 2));
+      const a = clamp(f * band * fk * (0.8 + valley));
+      over3(k, mix(C.fogDeep[0], C.fog[0], f), mix(C.fogDeep[1], C.fog[1], f), mix(C.fogDeep[2], C.fog[2], f), a * 0.85);
+    }
+  }
+
+  // the water: ripples moving in toward us, finer toward the far shore, catching
+  // the grey of the sky, more of it out to the right
+  const w0 = Math.floor(rows * SHORE), w1 = Math.min(rows, Math.ceil(rows * (LAWN + 0.01)));
+  for (let r = w0; r < w1; r++) {
+    const v = (r + 0.5) / rows;
+    const near = clamp((v - SHORE) / (LAWN - SHORE));
+    const fy = mix(0.95, 0.42, near), fx = mix(0.1, 0.035, near);
+    const speed = mix(1.1, 0.55, near);
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c;
+      if (ZONE[k] !== WATER) continue;
+      const u = (c + 0.5) / cols;
+      const n = noise(c * fx + t * 0.1, r * fy - t * speed) * 0.65 + noise(c * fx * 2.3 - t * 0.07, r * fy * 2.1 - t * speed * 1.7) * 0.35;
+      const reach = 0.3 + 0.7 * smooth(0.35, 0.85, u) * (0.6 + 0.4 * noise(c * 0.02, r * 0.05 + 4));
+      const glint = smooth(0.52, 0.9, n) * reach * (0.75 + 0.5 * wind);
+      add(k, C.sheen, glint * 0.55);
+    }
+  }
+
+  // the swan: across from the right and out to the left, about four minutes a crossing
+  const P = 250;
+  const pos = frac(t / P + 0.44);
+  const su = 1.14 - 1.3 * pos;
+  const S = Math.max(1, H * 0.0105); // its size unit, in cells
+  const sx = su * cols, sy = (0.585 + 0.012 * Math.sin(su * 3.1)) * rows + 0.12 * Math.sin(t * 1.3);
+  const nod = 0.25 * Math.sin(t * 0.37);
+
+  // its wake: two arms opening out behind it, the near one wider, shimmering and
+  // fading with distance, with a trail of churned water between
+  const L = cols * 0.38;
+  for (let r = Math.max(w0, Math.floor(sy - L * 0.09 - 2)); r < Math.min(w1, Math.ceil(sy + L * 0.14 + 3)); r++) {
+    for (let c = Math.max(0, Math.floor(sx + S * 2)); c < Math.min(cols, Math.ceil(sx + L)); c++) {
+      const k = r * cols + c;
+      if (ZONE[k] !== WATER) continue;
+      const d = c + 0.5 - (sx + S * 2.5);
+      if (d < 0) continue;
+      const y = r + 0.5;
+      const fade = Math.exp(-d / (L * 0.33));
+      const w = 0.55 + d * 0.025;
+      const far = sy - 0.2 - d * 0.075, nearArm = sy + 0.35 + d * 0.12;
+      const flick = 0.55 + 0.45 * noise(d * 0.35 - t * 1.6, y * 0.8);
+      const arms = Math.exp(-(((y - far) / w) ** 2)) * 0.8 + Math.exp(-(((y - nearArm) / (w * 1.2)) ** 2));
+      const trail = Math.exp(-(((y - sy - 0.2) / 0.7) ** 2)) * Math.exp(-d / (L * 0.12)) * 0.6;
+      add(k, C.sheen, (arms * flick + trail * flick) * fade * 0.55);
+    }
+  }
+
+  // its reflection, broken up by the ripples, then the swan itself
+  const bx = Math.ceil(5 * S) + 2, top = Math.ceil(5.3 * S) + 2;
+  for (let r = Math.max(0, Math.floor(sy - top)); r < Math.min(rows, Math.ceil(sy + top)); r++) {
+    for (let c = Math.max(0, Math.floor(sx - bx)); c < Math.min(cols, Math.ceil(sx + bx)); c++) {
+      const k = r * cols + c;
+      const y = (r + 0.5 - sy) / S;
+      if (y > 0) {
+        if (ZONE[k] !== WATER) continue;
+        const wob = 0.35 * Math.sin(y * 2.2 + t * 2.7);
+        const [d] = swanShape((c + 0.5 - sx) / S + wob, -y - (y > 1.2 ? nod * 0.2 : 0));
+        const a = clamp(0.5 - d * S) * 0.32 * (0.5 + 0.5 * noise(c * 0.5, r * 1.3 - t * 2));
+        if (a > 0) over(k, C.swanShade, a);
+        continue;
+      }
+      const hx = (c + 0.5 - sx) / S, hy = y;
+      // the neck and head nod a little
+      const lean = hy < -1.6 ? nod * (-1.6 - hy) / 3 : 0;
+      const [d, part] = swanShape(hx - lean, hy);
+      const a = clamp(0.5 - d * S);
+      if (a <= 0) continue;
+      over(k, part === 3 ? C.beak : part === 1 ? C.swanShade : C.swan, a);
+    }
+  }
+
+  // rain: rings opening on the water, and a faint drizzle in the air
+  if (RAIN > 0) {
+    const rings = sc.rings;
+    sc.spawn += dt * RAIN * 5 * Math.max(0.6, cols / 190);
+    while (sc.spawn >= 1) {
+      sc.spawn -= 1;
+      const v = mix(SHORE + 0.01, LAWN - 0.01, Math.random());
+      rings.push({ x: Math.random() * cols, y: v * rows, s: mix(0.45, 1.4, (v - SHORE) / (LAWN - SHORE)), age: 0 });
+    }
+    for (let i = rings.length - 1; i >= 0; i--) {
+      const g = rings[i];
+      g.age += dt;
+      const life = 1.5;
+      if (g.age > life) { rings.splice(i, 1); continue; }
+      const rad = 0.6 + g.age * 2.6 * g.s, amp = (1 - g.age / life) * 0.45;
+      const ry = 0.32;
+      for (let r = Math.max(w0, Math.floor(g.y - rad * ry - 1)); r <= Math.min(w1 - 1, Math.ceil(g.y + rad * ry + 1)); r++) {
+        for (let c = Math.max(0, Math.floor(g.x - rad - 1)); c <= Math.min(cols - 1, Math.ceil(g.x + rad + 1)); c++) {
+          const k = r * cols + c;
+          if (ZONE[k] !== WATER) continue;
+          const e = Math.hypot(c + 0.5 - g.x, (r + 0.5 - g.y) / ry);
+          const ring = Math.exp(-(((e - rad) / 0.7) ** 2)) * amp;
+          if (ring > 0.01) add(k, C.sheen, ring);
+        }
+      }
+    }
+    const drops = Math.round(RAIN * cols * rows / 1600);
+    const slant = 0.25 * wind;
+    for (let i = 0; i < drops; i++) {
+      const x = Math.random() * cols, y = Math.random() * rows * LAWN;
+      for (let j = 0; j < 2; j++) {
+        const c = Math.floor(x + j * slant), r = Math.floor(y + j);
+        if (c < 0 || c >= cols || r >= rows) continue;
+        add(r * cols + c, C.rain, 0.07);
+      }
+    }
+  }
+
+  // wind over the grass: lighter bands sweeping across as the blades bend
+  const g0 = Math.floor(rows * (LAWN - 0.01));
+  for (let r = g0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c;
+      if (ZONE[k] !== GRASS) continue;
+      const wave = smooth(0.45, 0.85, noise(c * 0.03 - t * (0.15 + 0.3 * wind), r * 0.05 + c * 0.012));
+      const f = 0.85 + 0.55 * wave * (0.4 + 0.6 * wind);
+      R[k] *= f; G[k] *= f; B[k] *= f;
+    }
+  }
+
+  // now and then a few birds cross under the cloud
+  const flight = t / 80 + 0.7;
+  const fp = frac(flight) / 0.32;
+  if (fp < 1) {
+    const rand = rng((Math.floor(flight) * 977 + SEED) | 0);
+    const n = 3 + Math.floor(rand() * 4);
+    // high, where they show dark against the bright cloud
+    const fx = (1.08 - 1.16 * fp) * cols, fy = (0.045 + 0.03 * rand()) * rows + Math.sin(fp * 4) * 1.5;
+    const span = Math.max(1.8, H * 0.017);
+    for (let i = 0; i < n; i++) {
+      const ox = i * span * 2.4 + rand() * span, oy = (i % 2 ? 1 : -1) * i * span * 0.6 + rand() * span;
+      const x = fx + ox, y = fy + oy;
+      const flap = Math.sin(t * 7 + i * 1.7);
+      const tipY = y - flap * span * 0.55;
+      for (let r = Math.max(0, Math.floor(y - span - 1)); r <= Math.min(rows - 1, Math.ceil(y + span + 1)); r++) {
+        for (let c = Math.max(0, Math.floor(x - span - 1)); c <= Math.min(cols - 1, Math.ceil(x + span + 1)); c++) {
+          const d = Math.min(seg(c + 0.5, r + 0.5, x, y, x - span, tipY), seg(c + 0.5, r + 0.5, x, y, x + span, tipY));
+          over(r * cols + c, C.bird, clamp(0.9 - d) * 0.95);
+        }
+      }
+    }
+  }
+
+  // --- to dots ----------------------------------------------------------------------
+  const PL = PAL.length;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c;
+      const cr = R[k], cg = G[k], cb = B[k];
+      const peak = Math.max(cr, cg, cb);
+      if (peak < 0.004) { out[k] = 0; continue; }
+      const level = LEVEL[Math.min(1023, (peak * 1023 + 0.5) | 0)];
+      const step = Math.max(0, Math.min(NL, Math.round(level * NL + DITHER[k])));
+      if (!step) { out[k] = 0; continue; }
+      const want = clamp((level + 0.02) / COVER[step]);
+      // the dot's colour: the cell's hue, lifted to make up for the dot's size, but
+      // never so far that a dim cell's dots come out bright
+      const s = Math.min(2.4, (0.25 + 0.75 * want) / peak);
+      out[k] = 1 + (step - 1) * PL + nearest(clamp(cr * s), clamp(cg * s), clamp(cb * s));
+    }
+  }
+  if (paint) draw();
+}
+
+// the same as over(), for a colour in three numbers (keeps the hot loop from allocating)
+function over3(k, r, g, b, a) {
+  if (a <= 0) return;
+  if (a > 1) a = 1;
+  R[k] += (r - R[k]) * a; G[k] += (g - G[k]) * a; B[k] += (b - B[k]) * a;
+}
+
+// copy changed cells from the atlas
+function draw() {
+  const PL = PAL.length;
+  ctx.fillStyle = GROUND;
+  for (let k = 0; k < N; k++) {
+    if (out[k] === prev[k]) continue;
+    const c = k % cols, r = (k / cols) | 0;
+    ctx.fillRect(c * px, r * px, px, px);
+  }
+  for (let k = 0; k < N; k++) {
+    const o = out[k];
+    if (o === prev[k]) continue;
+    prev[k] = o;
+    if (!o) continue;
+    const c = k % cols, r = (k / cols) | 0;
+    const step = 1 + (((o - 1) / PL) | 0), ci = (o - 1) % PL;
+    ctx.drawImage(atlas, ci * px, (step - 1) * px, px, px, c * px, r * px, px, px);
+  }
+}
+
+// --- run ----------------------------------------------------------------------------
+let resizeTimer = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { layout(); render(clock()); }, 150);
+});
+const t0 = performance.now();
+const clock = () => (performance.now() - t0) / 1000 + (+Q.get('t') || 0);
+layout();
+// let the rain be falling already
+for (let i = 0; i < 20; i++) render(clock() - 2 + i * 0.1, false);
+render(clock());
+let last = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (now - last < 1000 / FPS - 4) return;
+  last = now;
+  render(clock());
+}
+if (Q.get('still') !== '1') requestAnimationFrame(loop);
+// for recording previews: draw the frame at a given time
+window.__render = (t) => render(t);
+})();
+</script>
+</body>
+</html>

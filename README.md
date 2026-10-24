@@ -1,13 +1,15 @@
-# Mac ASCII Art: Plum Blossom Night
+# Mac ASCII Art
 
-A living ASCII-art wallpaper for your Mac. A branch of plum blossom crosses in
-front of a temple roof at night, drawn as a halftone of dots in the colours of
-the original photo: deep navy, slate, the pale blue of the lit roof, icy white
-petals with raspberry hearts.
+Living ASCII-art wallpapers for your Mac, each drawn as a halftone of dots in the colours of the
+photo it came from. Each scene is one HTML file with no dependencies, so it works offline. It's
+drawn on a canvas at 15 frames a second and redraws only the dots that change, so it's light on CPU.
+
+## Plum Blossom Night: `index.html`
+
+A branch of plum blossom crosses in front of a temple roof at night: deep navy, slate, the pale
+blue of the lit roof, icy white petals with raspberry hearts.
 
 ![Plum Blossom Night, animated](assets/preview.gif)
-
-What moves:
 
 - **The breeze** comes and goes in gusts. The branch bends with it and the hanging sprays swing.
 - **Petals** let go of the open blossoms, more in a gust, and drift down across the screen.
@@ -15,8 +17,20 @@ What moves:
 - **Dew** on the bark catches the light and twinkles.
 - **Mist** drifts over the dark facade, and cloud shadow moves slowly over the roof.
 
-It's one HTML file with no dependencies (`index.html`), drawn on a canvas at 15 frames a second.
-It redraws only the dots that change, so it's light on CPU.
+## Swan Lake Mist: `lake.html`
+
+A dark mountain lake under low cloud: grey fog, a spiky spruce treeline, black water, olive grass.
+
+![Swan Lake Mist, animated](assets/lake-preview.gif)
+
+- **Fog** drifts along the hills and the treeline, thickest down in the valley.
+- **A swan** glides across the lake, about four minutes a crossing, its wake opening out behind it.
+- **Rain** rings the water and drizzles faintly through the air. Ripples catch the grey of the sky.
+- **Wind** runs through the grass on the near bank in lighter waves.
+- **Birds**: now and then a few cross high under the cloud.
+
+Its options are `cell`, `fps`, `wind`, `seed`, `ramp` and `still` as below, plus `rain` (`0` for
+none, `2` or `3` for heavier rain) in place of `petals`.
 
 ## Set it as your Mac wallpaper
 
@@ -27,12 +41,13 @@ gap: it shows any website (online or a local file) as your desktop wallpaper, be
 2. **Get a link to the wallpaper**, either way works:
    - **Online (easiest):** in this repository on GitHub open **Settings → Pages**. Under
      *Build and deployment* choose **Deploy from a branch**, pick the branch with these files and
-     **/ (root)**, then **Save**. After a minute or so it's live at
-     <https://shyboy0499.github.io/Mac-ascii-art/>
+     **/ (root)**, then **Save**. After a minute or so the scenes are live at
+     <https://shyboy0499.github.io/Mac-ascii-art/> and
+     <https://shyboy0499.github.io/Mac-ascii-art/lake.html>
    - **Offline:** download this repo (**Code → Download ZIP**), unzip it somewhere it will stay
-     (for example `~/Pictures/Mac-ascii-art`), and use its `index.html`.
+     (for example `~/Pictures/Mac-ascii-art`), and use its `index.html` or `lake.html`.
 3. **Add it in Plash:** click Plash's icon in the menu bar → **Add Website**, paste the link (or
-   choose the local `index.html`), and it becomes your wallpaper.
+   choose the local file), and it becomes your wallpaper.
 
 To check the link first, open it in Safari.
 
@@ -41,8 +56,8 @@ Plash has two limits worth knowing:
 - It shows the page on **one display only**, the one picked in its settings.
 - It leaves out the **menu bar strip** at the top of the screen. If you hide the macOS menu bar
   (for example behind SketchyBar), your old wallpaper shows through there. Setting the normal macOS
-  wallpaper to the solid colour `#0B0F19` (System Settings → Wallpaper → Colors → Add Color) makes
-  that strip match.
+  wallpaper to a solid colour (System Settings → Wallpaper → Colors → Add Color) makes that strip
+  match: `#0B0F19` for the plum blossom, `#050906` for the lake.
 
 ### Every display, edge to edge: the built-in helper
 
@@ -56,6 +71,7 @@ Plash first so the two don't stack. Then run this from the repository folder:
 ```sh
 swiftc -O macos/wallpaper.swift -o ascii-wallpaper
 ./ascii-wallpaper                              # this folder's index.html
+./ascii-wallpaper lake.html                    # the swan lake
 ./ascii-wallpaper "index.html?fps=10&petals=2" # with options
 ./ascii-wallpaper "ascii-rest.html?piece=lantern-lake"
 ```
