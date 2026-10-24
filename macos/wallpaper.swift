@@ -25,55 +25,84 @@ func target(_ arg: String) -> URL? {
 
 final class Wallpaper: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     let url: URL
-    var windows: [NSWindow] = []
+    // one window a display, by its display ID
+    var windows: [CGDirectDisplayID: NSWindow] = [:]
 
     init(url: URL) { self.url = url }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        show()
-        // displays plugged in, unplugged or rearranged
+        update()
         NotificationCenter.default.addObserver(
             self, selector: #selector(screensChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
     }
 
+    // macOS sends this for far more than displays coming and going: waking
+    // from sleep, the menu bar or the Dock showing. So wait for it to settle,
+    // then touch only what really changed, and never reload a page that's
+    // already showing: that's what made the wallpaper blink and start over.
     @objc func screensChanged() {
-        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(show), object: nil)
-        perform(#selector(show), with: nil, afterDelay: 1)
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(update), object: nil)
+        perform(#selector(update), with: nil, afterDelay: 0.5)
     }
 
-    @objc func show() {
-        windows.forEach { $0.close() }
-        windows = NSScreen.screens.map { screen in
-            // the whole screen, not just the part below the menu bar
-            let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
-            window.isReleasedWhenClosed = false
-            // just above the system wallpaper, below the desktop icons
-            window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
-            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]
-            window.ignoresMouseEvents = true
-            window.hasShadow = false
-            window.backgroundColor = NSColor(srgbRed: 0.043, green: 0.059, blue: 0.098, alpha: 1)
-            // hidden until the page has drawn, so it never flashes white
-            window.alphaValue = 0
-
-            let web = WKWebView(frame: NSRect(origin: .zero, size: screen.frame.size), configuration: WKWebViewConfiguration())
-            web.autoresizingMask = [.width, .height]
-            web.navigationDelegate = self
-            window.contentView = web
-            if url.isFileURL {
-                web.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+    @objc func update() {
+        var seen = Set<CGDirectDisplayID>()
+        for screen in NSScreen.screens {
+            guard let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value else { continue }
+            seen.insert(id)
+            if let window = windows[id] {
+                if window.frame != screen.frame { window.setFrame(screen.frame, display: true) }
             } else {
-                web.load(URLRequest(url: url))
+                windows[id] = makeWindow(for: screen)
             }
-            window.setFrame(screen.frame, display: false)
-            window.orderFront(nil)
-            return window
+        }
+        for (id, window) in windows where !seen.contains(id) {
+            window.close()
+            windows[id] = nil
+        }
+    }
+
+    func makeWindow(for screen: NSScreen) -> NSWindow {
+        // the whole screen, not just the part below the menu bar
+        let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        // just above the system wallpaper, below the desktop icons
+        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]
+        window.ignoresMouseEvents = true
+        window.hasShadow = false
+        window.backgroundColor = NSColor(srgbRed: 0.043, green: 0.059, blue: 0.098, alpha: 1)
+        // hidden until the page has drawn, so it never flashes white
+        window.alphaValue = 0
+
+        let web = WKWebView(frame: NSRect(origin: .zero, size: screen.frame.size), configuration: WKWebViewConfiguration())
+        web.autoresizingMask = [.width, .height]
+        web.navigationDelegate = self
+        window.contentView = web
+        loadPage(web)
+        window.setFrame(screen.frame, display: false)
+        window.orderFront(nil)
+        return window
+    }
+
+    func loadPage(_ web: WKWebView) {
+        if url.isFileURL {
+            web.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        } else {
+            web.load(URLRequest(url: url))
         }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { webView.window?.alphaValue = 1 }
+    }
+
+    // if macOS stops the page's process (low memory, say), bring it back
+    // instead of leaving the screen blank
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        webView.window?.alphaValue = 0
+        loadPage(webView)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

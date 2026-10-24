@@ -160,11 +160,16 @@ const SKY = 0, HILL = 1, BACK = 2, FRONT = 3, LEAFY = 4, BANK = 5, WATER = 6, GR
 const SHORE = 0.5, LAWN = 0.775;
 const lawnAt = (u) => LAWN + 0.004 * Math.sin(u * 9.1) + 0.003 * Math.sin(u * 23.7 + 1);
 
-function layout() {
+// the grid the window holds right now: cell size in device pixels, columns, rows
+function grid() {
   const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
-  px = Math.max(2, Math.round(CELL * dpr));
-  cols = Math.ceil((window.innerWidth * dpr) / px);
-  rows = Math.ceil((window.innerHeight * dpr) / px);
+  const p = Math.max(2, Math.round(CELL * dpr));
+  return [p, Math.ceil((window.innerWidth * dpr) / p), Math.ceil((window.innerHeight * dpr) / p), dpr];
+}
+
+function layout() {
+  let dpr;
+  [px, cols, rows, dpr] = grid();
   N = cols * rows;
   canvas.width = cols * px;
   canvas.height = rows * px;
@@ -615,8 +620,22 @@ function draw() {
 let resizeTimer = 0;
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => { layout(); render(clock()); }, 150);
+  resizeTimer = setTimeout(() => {
+    // start over only when the grid itself changes, not on every resize event
+    const [p, c, r] = grid();
+    if (p === px && c === cols && r === rows) return;
+    layout();
+    render(clock());
+  }, 150);
 });
+// WebKit can throw away a hidden page's canvas, and only cells that change get
+// redrawn, so paint every cell again when the page comes back
+function repaint() {
+  prev.fill(0xffff);
+  render(clock());
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) repaint(); });
+canvas.addEventListener('contextrestored', repaint);
 const t0 = performance.now();
 const clock = () => (performance.now() - t0) / 1000 + (+Q.get('t') || 0);
 layout();
