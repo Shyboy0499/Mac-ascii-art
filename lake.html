@@ -334,7 +334,9 @@ function buildBackground() {
 
 // --- the things that move ------------------------------------------------------------
 function buildScene() {
-  return { rings: [], spawn: 0 };
+  // fog and grass waves move at the wind's speed, so their positions are
+  // stepped along frame by frame rather than worked out from the time
+  return { rings: [], spawn: 0, fog: 0, grass: 0 };
 }
 
 // blend a colour over a cell, or add light to it
@@ -397,7 +399,8 @@ function render(t, paint = true) {
   // out on a coarse lattice and blended between
   const fogRows = Math.min(rows, Math.ceil(rows * SHORE));
   const fc = Math.ceil(cols / FS) + 2, fr = Math.ceil(fogRows / FS) + 2;
-  const drift = t * (0.6 + 0.5 * wind);
+  sc.fog += dt * (0.6 + 0.5 * wind);
+  const drift = sc.fog;
   for (let j = 0; j < fr; j++) {
     for (let i = 0; i < fc; i++) {
       const c = i * FS, r = j * FS;
@@ -534,12 +537,13 @@ function render(t, paint = true) {
   }
 
   // wind over the grass: lighter bands sweeping across as the blades bend
+  sc.grass += dt * (0.15 + 0.3 * wind);
   const g0 = Math.floor(rows * (LAWN - 0.01));
   for (let r = g0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const k = r * cols + c;
       if (ZONE[k] !== GRASS) continue;
-      const wave = smooth(0.45, 0.85, noise(c * 0.03 - t * (0.15 + 0.3 * wind), r * 0.05 + c * 0.012));
+      const wave = smooth(0.45, 0.85, noise(c * 0.03 - sc.grass, r * 0.05 + c * 0.012));
       const f = 0.85 + 0.55 * wave * (0.4 + 0.6 * wind);
       R[k] *= f; G[k] *= f; B[k] *= f;
     }
