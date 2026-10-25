@@ -58,6 +58,7 @@ final class Wallpaper: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             }
         }
         for (id, window) in windows where !seen.contains(id) {
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: window)
             window.close()
             windows[id] = nil
         }
@@ -79,11 +80,39 @@ final class Wallpaper: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         let web = WKWebView(frame: NSRect(origin: .zero, size: screen.frame.size), configuration: WKWebViewConfiguration())
         web.autoresizingMask = [.width, .height]
         web.navigationDelegate = self
+        // WebKit treats a page whose window is covered by other windows as
+        // hidden: it stops drawing it, and when the window is uncovered it
+        // shows the empty window for a few frames before the page paints
+        // again. Under a tiling window manager the wallpaper is nearly always
+        // covered, so that was a blink on every workspace switch. This private
+        // switch turns that off; it only takes effect before the view goes in
+        // its window, and is checked first in case a macOS drops it.
+        if web.responds(to: Selector(("_setWindowOcclusionDetectionEnabled:"))) {
+            web.setValue(false, forKey: "windowOcclusionDetectionEnabled")
+        }
         window.contentView = web
         loadPage(web)
         window.setFrame(screen.frame, display: false)
         window.orderFront(nil)
+        // pause the animation ourselves while covered, keeping what's drawn
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(occlusionChanged(_:)),
+            name: NSWindow.didChangeOcclusionStateNotification, object: window)
         return window
+    }
+
+    @objc func occlusionChanged(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, let web = window.contentView as? WKWebView else { return }
+        syncPause(web)
+    }
+
+    // Tell the page whether anyone can see it. Its animation stops while it's
+    // covered, but WebKit keeps the last frame, so it's there the moment the
+    // windows move away. Pages without the hook just keep running.
+    func syncPause(_ web: WKWebView) {
+        guard let window = web.window else { return }
+        let covered = !window.occlusionState.contains(.visible)
+        web.evaluateJavaScript("window.__setPaused && window.__setPaused(\(covered))", completionHandler: nil)
     }
 
     func loadPage(_ web: WKWebView) {
@@ -95,6 +124,17 @@ final class Wallpaper: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        // match the window to the page's own background, so if anything ever
+        // does show through for a frame it's the same colour
+        webView.evaluateJavaScript("getComputedStyle(document.body).backgroundColor") { result, _ in
+            guard let css = result as? String else { return }
+            let n = css.split(whereSeparator: { !"0123456789.".contains($0) }).compactMap { Double($0) }
+            guard n.count >= 3 else { return }
+            let color = NSColor(srgbRed: n[0] / 255, green: n[1] / 255, blue: n[2] / 255, alpha: 1)
+            webView.window?.backgroundColor = color
+            if #available(macOS 12.0, *) { webView.underPageBackgroundColor = color }
+        }
+        syncPause(webView)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { webView.window?.alphaValue = 1 }
     }
 

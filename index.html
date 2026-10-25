@@ -771,19 +771,34 @@ function repaint() {
 document.addEventListener('visibilitychange', () => { if (!document.hidden) repaint(); });
 canvas.addEventListener('contextrestored', repaint);
 const t0 = performance.now();
-const clock = () => (performance.now() - t0) / 1000 + (+Q.get('t') || 0);
+// time stands still while the wallpaper is paused, so nothing jumps when it's back
+let pausedAt = 0, pausedFor = 0;
+const clock = () => ((pausedAt || performance.now()) - t0 - pausedFor) / 1000 + (+Q.get('t') || 0);
 layout();
 // let a few petals be in the air already
 for (let i = 0; i < 90; i++) render(clock() - 9 + i * 0.1, false);
 render(clock());
-let last = 0;
+let last = 0, frame = 0;
 function loop(now) {
-  requestAnimationFrame(loop);
+  frame = requestAnimationFrame(loop);
   if (now - last < 1000 / FPS - 4) return;
   last = now;
   render(clock());
 }
-if (Q.get('still') !== '1') requestAnimationFrame(loop);
+if (Q.get('still') !== '1') frame = requestAnimationFrame(loop);
+// The macOS helper calls this as windows cover and uncover the wallpaper: it
+// stops drawing while nobody can see it, and leaves the last frame in place.
+window.__setPaused = (pause) => {
+  if (Q.get('still') === '1' || !pause === !pausedAt) return;
+  if (pause) {
+    pausedAt = performance.now();
+    cancelAnimationFrame(frame);
+  } else {
+    pausedFor += performance.now() - pausedAt;
+    pausedAt = 0;
+    frame = requestAnimationFrame(loop);
+  }
+};
 // for recording previews: draw the frame at a given time
 window.__render = (t) => render(t);
 })();
