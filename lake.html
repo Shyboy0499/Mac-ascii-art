@@ -446,11 +446,12 @@ function render(t, paint = true) {
     }
   }
 
-  // the swan: across from the right and out to the left, about four minutes a crossing
+  // the swan: across from the right and out to the left, about four minutes a
+  // crossing, turning up again on the right a few seconds after it's gone
   const P = 250;
-  const pos = frac(t / P + 0.44);
-  const su = 1.14 - 1.3 * pos;
-  const S = Math.max(1, H * 0.0105); // its size unit, in cells
+  const pos = frac(t / P + 0.45);
+  const su = 1.05 - 1.1 * pos;
+  const S = Math.max(1.3, H * 0.014); // its size unit, in cells
   const sx = su * cols, sy = (0.585 + 0.012 * Math.sin(su * 3.1)) * rows + 0.12 * Math.sin(t * 1.3);
   const nod = 0.25 * Math.sin(t * 0.37);
 
