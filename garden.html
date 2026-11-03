@@ -1,0 +1,854 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rain Garden Pavilion</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #050605; }
+  canvas { position: fixed; left: 0; top: 0; display: block; }
+</style>
+</head>
+<body>
+<canvas id="wall"></canvas>
+<script>
+/*
+ * rain garden pavilion: a classical Chinese garden in the rain, in the colours
+ * of the photo it was drawn from. A two-storey pavilion with upswept eaves
+ * stands over dark water, wet stone steps run down to a carved bridge, a red
+ * maple leans in from the left, a lattice screen closes the right and leaves
+ * hang from above. Rain falls and rings the water, the eaves drip, the red
+ * lanterns glow and sway, the leaves move in the wind, maple leaves drop and
+ * float, and mist drifts over the walls behind.
+ *
+ * Drawn the same way as index.html: every cell of a square grid is shaded in
+ * colour, then drawn as a halftone dot whose size is its brightness
+ * (ordered-dithered) and whose colour is the nearest in a palette sampled
+ * from the photo. The still parts are drawn once with canvas shapes; it's one
+ * file on purpose, so it works offline and as a local file in Plash.
+ *
+ * Options, as URL parameters: garden.html?cell=8&fps=15&rain=1&wind=1&seed=7
+ *   cell    size of a grid cell in screen points (smaller = finer, more CPU)
+ *   fps     frames a second
+ *   rain    how hard it rains (0 for none)
+ *   wind    how strong the wind is in the leaves (0 for still air)
+ *   seed    a different scatter of leaves
+ *   ramp    dots (default) or ascii, to draw with " .:-=+*#%@" instead
+ *   still   1 to draw one frame and stop (no animation, no CPU)
+ */
+(() => {
+'use strict';
+
+const Q = new URLSearchParams(location.search);
+const opt = (k, d, lo, hi) => {
+  const v = parseFloat(Q.get(k));
+  return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d;
+};
+const CELL = opt('cell', 8, 3, 40);
+const FPS = opt('fps', 15, 1, 60);
+const RAIN = opt('rain', 1, 0, 5);
+const WIND = opt('wind', 1, 0, 4);
+const SEED = opt('seed', 7, 0, 1e9) | 0;
+const ASCII = Q.get('ramp') === 'ascii';
+
+// Sampled from the photo and lifted out of its near-black: the greys of the
+// walls, roofs and wet stone, the greens of the shrubs and hanging leaves, the
+// dark reds of the maple, the black water, and the red of the lanterns.
+const GROUND = '#050605';
+const PALETTE = [
+  '#141514', '#1d1e1d', '#262726', '#30312f', '#3b3c3a', '#474846', '#555654', '#646562', '#747572',
+  '#868884', '#9a9c98', '#afb1ad', '#c4c6c2', '#d9dbd7',
+  '#2f2c28', '#3d3a35', '#4d4a44', '#5f5b55',
+  '#141c12', '#1c2718', '#25331f', '#2f3f27', '#3b4d30', '#4a5e3b', '#5b7048', '#6e8a52', '#86a466',
+  '#1f1010', '#2c1615', '#3b1d1c', '#4c2523', '#5e2e2b', '#733834', '#8a4540', '#9a4a46', '#a0524c', '#b5635c', '#6b6a3a', '#8f8d52',
+  '#c23a26', '#e86a36', '#ffa060',
+  '#0c100e', '#151b18', '#1f2723', '#2b3530',
+];
+
+// the glyphs: dot radii in cell widths, or a ramp of characters
+const LEVELS = ASCII ? ' .:-=+*#%@' : ' ·•●';
+const NL = LEVELS.length - 1;
+const RADII = [0, 0.13, 0.25, 0.42];
+// how much of a full dot's light each level gives
+const COVER = ASCII
+  ? [0, 0.08, 0.16, 0.22, 0.3, 0.38, 0.5, 0.66, 0.82, 1]
+  : [0, 0.16, 0.45, 1];
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16 - 0.5);
+
+// --- maths ---------------------------------------------------------------------------
+const clamp = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const smooth = (a, b, v) => { const k = clamp((v - a) / (b - a)); return k * k * (3 - 2 * k); };
+const mix = (a, b, k) => a + (b - a) * k;
+const hex = (s) => [1, 3, 5].map((i) => parseInt(s.slice(i, i + 2), 16) / 255);
+const TAU = Math.PI * 2;
+// a cell's brightness to its dot level: lifted in the darks, since nearly all
+// of this scene is in shadow
+const LEVEL = new Float32Array(1024).map((_, i) => clamp(Math.pow(i / 1023, 1.15) * 1.25));
+
+function hash(x, y) {
+  let h = Math.imul(x | 0, 0x27d4eb2d) ^ Math.imul(y | 0, 0x165667b1);
+  h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const fx = x - xi, fy = y - yi;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y, oct) {
+  let s = 0, n = 0, amp = 0.5, f = 1;
+  for (let i = 0; i < oct; i++) { s += amp * noise(x * f, y * f); n += amp; amp *= 0.5; f *= 2.03; }
+  return s / n;
+}
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// the wind: a steady air with gusts that build and die away
+function gustAt(t) { return smooth(0.5, 0.8, noise(t * 0.05, 3.3)); }
+function windAt(t) { return WIND * (0.3 + 0.25 * noise(t * 0.17, 8.1) + 0.6 * gustAt(t)); }
+
+// --- colours -------------------------------------------------------------------------
+const PAL = PALETTE.map(hex);
+const C = {
+  mist: hex('#8e918e'), sheen: hex('#7d8682'), rain: hex('#a9aca8'), splash: hex('#c4c6c2'),
+  lantern: hex('#c23a26'), lanternLit: hex('#ff8a48'), glow: hex('#c25236'), cap: hex('#1a1210'),
+  leaf: hex('#1f2b19'), leafLit: hex('#6e8f52'), leafDark: hex('#0c110a'),
+  maple: hex('#8a4540'), mapleLit: hex('#a5534c'),
+};
+
+// nearest palette colour, cached on a 6-bit cube
+const near = new Int16Array(1 << 18).fill(-1);
+function nearest(r, g, b) {
+  const key = (((r * 63 + 0.5) | 0) << 12) | (((g * 63 + 0.5) | 0) << 6) | ((b * 63 + 0.5) | 0);
+  let i = near[key];
+  if (i >= 0) return i;
+  let best = 1e9;
+  for (let j = 0; j < PAL.length; j++) {
+    const p = PAL[j];
+    const rm = (r + p[0]) / 2;
+    const dr = r - p[0], dg = g - p[1], db = b - p[2];
+    const d = (2 + rm) * dr * dr + 4 * dg * dg + (3 - rm) * db * db;
+    if (d < best) { best = d; i = j; }
+  }
+  near[key] = i;
+  return i;
+}
+
+// --- the grid --------------------------------------------------------------------------
+const canvas = document.getElementById('wall');
+const ctx = canvas.getContext('2d');
+let cols = 0, rows = 0, N = 0, px = 0;
+let R, G, B, bgR, bgG, bgB, WATER, WET, MAPLE, out, prev, atlas, DITHER, FN;
+const FS = 3; // the mist lattice's spacing, in cells
+let scene = null;
+
+// the grid the window holds right now: cell size in device pixels, columns, rows
+function grid() {
+  const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+  const p = Math.max(2, Math.round(CELL * dpr));
+  return [p, Math.ceil((window.innerWidth * dpr) / p), Math.ceil((window.innerHeight * dpr) / p), dpr];
+}
+
+function layout() {
+  let dpr;
+  [px, cols, rows, dpr] = grid();
+  N = cols * rows;
+  canvas.width = cols * px;
+  canvas.height = rows * px;
+  canvas.style.width = (cols * px) / dpr + 'px';
+  canvas.style.height = (rows * px) / dpr + 'px';
+  R = new Float32Array(N); G = new Float32Array(N); B = new Float32Array(N);
+  bgR = new Float32Array(N); bgG = new Float32Array(N); bgB = new Float32Array(N);
+  WATER = new Float32Array(N); WET = new Float32Array(N); MAPLE = new Float32Array(N);
+  // ordered dither, roughened with a little noise so flat areas don't read as a mesh
+  DITHER = new Float32Array(N);
+  for (let k = 0; k < N; k++) {
+    const c = k % cols, r = (k / cols) | 0;
+    DITHER[k] = 0.62 * BAYER[(r & 3) * 4 + (c & 3)] + 0.36 * (hash(c * 7 + 3, r * 13 + 1) - 0.5);
+  }
+  out = new Uint16Array(N);
+  prev = new Uint16Array(N).fill(0xffff);
+  FN = new Float32Array((Math.ceil(cols / FS) + 3) * (Math.ceil(rows / FS) + 3));
+  buildAtlas();
+  buildBackground();
+  scene = buildScene();
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+// each (level, colour) drawn once, then copied into cells
+function buildAtlas() {
+  atlas = document.createElement('canvas');
+  atlas.width = PAL.length * px;
+  atlas.height = NL * px;
+  const a = atlas.getContext('2d');
+  a.textAlign = 'center';
+  a.textBaseline = 'middle';
+  a.font = `${Math.round(px * 1.05)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  for (let s = 1; s <= NL; s++) {
+    for (let i = 0; i < PAL.length; i++) {
+      a.fillStyle = PALETTE[i];
+      const cx = i * px + px / 2, cy = (s - 1) * px + px / 2;
+      if (ASCII) {
+        a.fillText(LEVELS[s], cx, cy);
+      } else {
+        a.beginPath();
+        a.arc(cx, cy, Math.max(0.6, RADII[s] * px), 0, TAU);
+        a.fill();
+      }
+    }
+  }
+}
+
+// --- the still picture -----------------------------------------------------------------
+// Where things are, as fractions of the screen's width (u) and height (v).
+// The pavilion's lower roof: its eave as curves from the left tip to the right.
+const EAVE = [[0.37, 0.17], [0.405, 0.285], [0.5, 0.3], [0.65, 0.322], [0.8, 0.3], [0.895, 0.285], [0.935, 0.175]];
+const UPPER_EAVE = [[0.49, 0.005], [0.53, 0.06], [0.6, 0.068], [0.7, 0.078], [0.8, 0.07], [0.88, 0.06], [0.93, 0.02]];
+// the dark eave of the building we're standing in, across the top left
+const BEAM = [[0, 0.075], [0.62, 0.045]];
+const LANTERNS = [[0.555, 0.335], [0.765, 0.33]];
+
+// points along a chain of quadratic curves, each through every other point
+function curve(pts, n) {
+  const outPts = [];
+  for (let i = 0; i + 2 < pts.length; i += 2) {
+    const [a, b, c] = [pts[i], pts[i + 1], pts[i + 2]];
+    for (let j = 0; j < n; j++) {
+      const t = j / n, m = 1 - t;
+      outPts.push([m * m * a[0] + 2 * m * t * b[0] + t * t * c[0], m * m * a[1] + 2 * m * t * b[1] + t * t * c[1]]);
+    }
+  }
+  outPts.push(pts[pts.length - 1]);
+  return outPts;
+}
+
+function buildBackground() {
+  // drawn with canvas shapes at three times the grid's resolution, then each
+  // cell takes the average of what covers it
+  const SS = 3, A = cols / rows;
+  const W3 = cols * SS, H3 = rows * SS;
+  const big = document.createElement('canvas'), msk = document.createElement('canvas');
+  big.width = msk.width = W3; big.height = msk.height = H3;
+  const g = big.getContext('2d', { willReadFrequently: true });
+  const m = msk.getContext('2d', { willReadFrequently: true });
+  // one unit is the screen's height
+  for (const c of [g, m]) { c.setTransform(H3, 0, 0, H3, 0, 0); c.lineCap = 'round'; c.lineJoin = 'round'; }
+  const rand = rng(SEED * 13 + 5);
+  const X = (u) => u * A;
+  const shape = (pts) => (c) => {
+    c.beginPath();
+    pts.forEach(([u, v], i) => (i ? c.lineTo(X(u), v) : c.moveTo(X(u), v)));
+    c.closePath();
+  };
+  const rect = (u0, v0, u1, v1) => shape([[u0, v0], [u1, v0], [u1, v1], [u0, v1]]);
+  // fill a shape in the picture, and in the masks with what it is: red for
+  // water, green for wet stone, blue for the maple, black for anything else
+  const fill = (s, colour, mask = '#000') => {
+    s(g); g.fillStyle = colour; g.fill();
+    s(m); m.fillStyle = mask; m.fill();
+  };
+  const line = (pts, colour, width, mask = null) => {
+    for (const c of mask ? [g, m] : [g]) {
+      c.beginPath();
+      pts.forEach(([u, v], i) => (i ? c.lineTo(X(u), v) : c.moveTo(X(u), v)));
+      c.strokeStyle = c === g ? colour : mask;
+      c.lineWidth = width;
+      c.stroke();
+    }
+  };
+  const disc = (u, v, r, colour, mask = '#000') => fill((c) => { c.beginPath(); c.arc(X(u), v, r, 0, TAU); }, colour, mask);
+  const vgrad = (v0, v1, a, b) => { const gr = g.createLinearGradient(0, v0, 0, v1); gr.addColorStop(0, a); gr.addColorStop(1, b); return gr; };
+
+  // the dark, and the overcast sky through the gaps at the top right
+  fill(rect(0, 0, 1.01, 1.01), '#0a0b0a');
+  fill(rect(0.38, 0, 1.01, 0.3), vgrad(0, 0.3, '#c2c5c1', '#959894'));
+
+  // the white-walled building at the back left, its dark roof and a lattice window
+  fill(rect(0, 0.07, 0.44, 0.34), vgrad(0.07, 0.34, '#9fa19d', '#71736f'));
+  fill(shape([[0, 0.06], [0.44, 0.075], [0.44, 0.11], [0, 0.1]]), '#2b2b29');
+  for (let u = 0; u < 0.44; u += 0.012) line([[u, 0.065], [u + 0.004, 0.105]], '#4a4a46', 0.003);
+  fill(rect(0.05, 0.15, 0.115, 0.23), '#262725');
+  for (let v = 0.155; v < 0.23; v += 0.012) line([[0.05, v], [0.115, v]], '#5a5b57', 0.0025);
+  for (let u = 0.055; u < 0.115; u += 0.012) line([[u, 0.15], [u, 0.23]], '#5a5b57', 0.0025);
+
+  // a dark timber building behind the pavilion, lattice windows in it
+  fill(rect(0.36, 0.08, 0.62, 0.32), '#141413');
+  for (let i = 0; i < 3; i++) {
+    const u0 = 0.385 + i * 0.075;
+    fill(rect(u0, 0.12, u0 + 0.05, 0.22), '#121211');
+    for (let v = 0.125; v < 0.22; v += 0.014) line([[u0, v], [u0 + 0.05, v]], '#3a3935', 0.0025);
+    for (let u = u0 + 0.006; u < u0 + 0.05; u += 0.012) line([[u, 0.12], [u, 0.22]], '#3a3935', 0.0025);
+  }
+
+  // a fan palm against the white wall
+  for (let i = 0; i < 26; i++) {
+    const a = -Math.PI * (0.05 + 0.9 * (i / 25)) + (rand() - 0.5) * 0.15;
+    const len = 0.08 + rand() * 0.05;
+    const cu = 0.27, cv = 0.22;
+    const tip = [cu + (Math.cos(a) * len) / A * 1.1, cv + Math.sin(a) * len * 0.9];
+    line([[cu, cv], tip], rand() < 0.3 ? '#3b4c2f' : '#22301d', 0.006);
+    for (let j = 1; j <= 4; j++) {
+      const k = 0.35 + j * 0.15;
+      const base = [cu + (tip[0] - cu) * k, cv + (tip[1] - cv) * k];
+      line([base, [base[0] + Math.cos(a + 0.5) * 0.02 / A, base[1] + Math.sin(a + 0.5) * 0.02]], '#1e2a19', 0.004);
+    }
+  }
+
+  // the gallery on the left: its sloping tiled roof, a grey wall and a white balustrade
+  fill(shape([[0, 0.245], [0.47, 0.285], [0.47, 0.345], [0, 0.31]]), '#2e2e2b');
+  for (let u = -0.02; u < 0.48; u += 0.011) line([[u, 0.25 + u * 0.085], [u + 0.006, 0.31 + u * 0.075]], '#4c4c47', 0.0035);
+  line([[0, 0.31], [0.47, 0.345]], '#6e6e68', 0.007);
+  for (let u = 0; u < 0.47; u += 0.012) disc(u, 0.312 + u * 0.074, 0.0045, '#5f5f59');
+  fill(shape([[0, 0.315], [0.47, 0.35], [0.47, 0.45], [0, 0.45]]), vgrad(0.32, 0.45, '#4a4b48', '#5c5d59'));
+  for (let i = 0; i < 6; i++) fill(rect(0.02 + i * 0.075, 0.36 + i * 0.003, 0.06 + i * 0.075, 0.41), '#1c1d1b');
+  fill(rect(0, 0.415, 0.5, 0.425), '#a3a5a1');
+  for (let u = 0.005; u < 0.5; u += 0.014) fill(rect(u, 0.425, u + 0.005, 0.45), '#8e908c');
+  fill(rect(0, 0.445, 0.5, 0.452), '#9a9c98');
+
+  // the pavilion's upper storey: dark timber, a lattice window, a white wall beside it
+  fill(rect(0.83, 0.05, 0.93, 0.22), vgrad(0.05, 0.22, '#9b9d99', '#7a7c78'));
+  fill(rect(0.58, 0.05, 0.84, 0.22), '#1b1a18');
+  fill(rect(0.67, 0.095, 0.75, 0.17), '#2a2926');
+  for (let v = 0.1; v < 0.17; v += 0.012) line([[0.67, v], [0.75, v]], '#55534e', 0.0025);
+  for (let u = 0.675; u < 0.75; u += 0.012) line([[u, 0.095], [u, 0.17]], '#55534e', 0.0025);
+  // its upper roof, cut off at the top, the corners swept up
+  const up = curve(UPPER_EAVE, 10);
+  fill(shape([[0.47, -0.01], [0.95, -0.01], ...up.slice().reverse()]), '#4d4d48');
+  for (let i = 0; i <= 28; i++) {
+    const p = up[Math.round((i / 28) * (up.length - 1))];
+    line([[0.5 + i * 0.016, -0.01], p], i % 2 ? '#383834' : '#6c6c65', 0.0035);
+  }
+  line(up, '#b0b0a8', 0.008);
+  disc(0.492, 0.006, 0.007, '#d0d0c8');
+  disc(0.928, 0.021, 0.007, '#d0d0c8');
+  // and its balcony, a band of lattice
+  fill(rect(0.56, 0.17, 0.87, 0.228), '#1c1b19');
+  for (let u = 0.565; u < 0.87; u += 0.022) {
+    line([[u, 0.178], [u + 0.011, 0.22]], '#4a4945', 0.0025);
+    line([[u + 0.011, 0.178], [u, 0.22]], '#4a4945', 0.0025);
+  }
+  line([[0.56, 0.172], [0.87, 0.172]], '#6e6c67', 0.006);
+  line([[0.56, 0.226], [0.87, 0.226]], '#3a3935', 0.004);
+
+  // the water, black-green, with the white gallery and the sky in it
+  fill(rect(0.1, 0.44, 1.01, 1.01), '#0b0d0c', '#f00');
+  g.save();
+  g.globalAlpha = 0.8;
+  fill(rect(0.12, 0.455, 0.48, 0.74), vgrad(0.455, 0.74, '#565c57', '#0b0d0c'), '#f00');
+  // the white balustrade's reflection, broken by the rain
+  for (let i = 0; i < 40; i++) {
+    const u = 0.14 + rand() * 0.34, v = 0.47 + rand() * 0.12;
+    line([[u, v], [u + 0.01 + rand() * 0.03, v]], '#8a8f8a', 0.003, '#f00');
+  }
+  g.globalAlpha = 0.5;
+  fill(rect(0.6, 0.56, 0.86, 0.66), vgrad(0.56, 0.66, '#3e4440', '#0b0d0c'), '#f00');
+  g.restore();
+
+  // inside the pavilion: shadow, a glimpse of a white wall beyond, the columns
+  // with couplets on them, and a carved frieze under the eave
+  fill(rect(0.45, 0.28, 0.88, 0.56), '#121211');
+  fill(rect(0.61, 0.35, 0.72, 0.5), vgrad(0.35, 0.5, '#7a7c78', '#3a3b39'));
+  fill(rect(0.48, 0.3, 0.87, 0.33), '#1a1917');
+  for (let u = 0.485; u < 0.87; u += 0.016) line([[u, 0.305], [u + 0.008, 0.325]], '#3c3a36', 0.0025);
+  for (const [u, w] of [[0.5, 0.02], [0.6, 0.026], [0.73, 0.026], [0.835, 0.02]]) {
+    fill(rect(u - w / 2, 0.3, u + w / 2, 0.57), '#1c1b19');
+    line([[u - w / 2 + 0.002, 0.32], [u - w / 2 + 0.002, 0.56]], '#6a665f', 0.004);
+  }
+  // couplets hung on the front columns, pale characters on dark boards
+  for (const u of [0.6, 0.73]) {
+    fill(rect(u - 0.008, 0.35, u + 0.008, 0.53), '#3f3a32');
+    for (let v = 0.362; v < 0.52; v += 0.019) disc(u + (rand() - 0.5) * 0.004, v, 0.004, '#c4baa6');
+  }
+
+  // the lower roof: tiles running down to the eave, the corners swept right up
+  const ev = curve(EAVE, 12);
+  fill(shape([[0.57, 0.225], [0.85, 0.225], ...ev.slice().reverse()]), '#55554f');
+  for (let i = 0; i <= 40; i++) {
+    const p = ev[Math.round((i / 40) * (ev.length - 1))];
+    const top = [mix(0.5, 0.9, i / 40), 0.225];
+    line([[Math.max(0.57, Math.min(0.85, top[0])), top[1]], p], i % 2 ? '#3d3d39' : '#76766f', 0.004);
+  }
+  // under the eave the shadow, then the eave's edge and the ridges to the corners
+  fill(shape([...ev, ...ev.slice().reverse().map(([u, v]) => [u, v + 0.022])]), '#0b0b0a');
+  line(ev, '#b4b4ac', 0.009);
+  for (const p of ev) disc(p[0], p[1] + 0.005, 0.0045, '#8a8a83');
+  line([[0.57, 0.225], [0.37, 0.17]], '#a5a59e', 0.009);
+  line([[0.85, 0.225], [0.935, 0.175]], '#a5a59e', 0.009);
+  line([[0.57, 0.225], [0.85, 0.225]], '#8a8a83', 0.007);
+  // the swept-up tips catch the most light
+  disc(0.372, 0.17, 0.008, '#d0d0c8');
+  disc(0.933, 0.175, 0.008, '#d0d0c8');
+
+  // a smaller maple behind, then the green shrub, then the big red maple in front
+  const clump = (cu, cv, ru, rv, n, dark, mid, lit, mask, size) => {
+    for (let i = 0; i < n; i++) {
+      const a = rand() * TAU, d = Math.sqrt(rand());
+      const u = cu + Math.cos(a) * d * ru, v = cv + Math.sin(a) * d * rv;
+      // lit from above: the upper side of the clump is brighter
+      const up = clamp(0.5 - (v - cv) / rv * 0.6 + (rand() - 0.5) * 0.5);
+      const colour = up > 0.75 ? lit : up > 0.35 ? mid : dark;
+      disc(u, v, size * (0.6 + rand() * 0.8), colour, mask);
+    }
+  };
+  clump(0.31, 0.4, 0.09, 0.07, 260, '#24130f', '#3c1f1d', '#5a2c2a', '#000', 0.009);
+  clump(0.25, 0.49, 0.2, 0.12, 700, '#141c12', '#22301d', '#3b4c2f', '#000', 0.01);
+  clump(0.1, 0.63, 0.2, 0.23, 1500, '#1d0f0e', '#3b1d1c', '#6a3230', '#00f', 0.008);
+  clump(0.26, 0.66, 0.05, 0.05, 90, '#2b2a16', '#4a4a26', '#6b6a3a', '#00f', 0.006);
+
+  // the pavilion's balustrade and floor
+  fill(rect(0.47, 0.49, 0.87, 0.555), '#1d1c1a');
+  for (let u = 0.475; u < 0.87; u += 0.026) {
+    fill(rect(u, 0.5, u + 0.017, 0.548), '#121211');
+    line([[u + 0.003, 0.505], [u + 0.014, 0.543]], '#45433f', 0.0025);
+    line([[u + 0.014, 0.505], [u + 0.003, 0.543]], '#45433f', 0.0025);
+  }
+  line([[0.47, 0.493], [0.87, 0.493]], '#6c6a65', 0.007);
+  fill(rect(0.48, 0.555, 0.86, 0.578), '#393733', '#0f0');
+  line([[0.48, 0.577], [0.86, 0.577]], '#5f5d58', 0.004, '#0f0');
+
+  // the steps down to the bridge, every tread wet
+  const steps = 7;
+  for (let i = 0; i < steps; i++) {
+    const v0 = 0.578 + i * 0.03, v1 = v0 + 0.03;
+    const l0 = mix(0.53, 0.5, i / steps), r0 = mix(0.81, 0.85, i / steps);
+    const l1 = mix(0.53, 0.5, (i + 1) / steps), r1 = mix(0.81, 0.85, (i + 1) / steps);
+    fill(shape([[l0, v0], [r0, v0], [r1, v0 + 0.012], [l1, v0 + 0.012]]), '#5e5c57', '#0f0');
+    fill(shape([[l1, v0 + 0.012], [r1, v0 + 0.012], [r1, v1], [l1, v1]]), '#252421');
+    line([[l1, v0 + 0.011], [r1, v0 + 0.011]], '#a3a19b', 0.005, '#0f0');
+    // puddles catching the sky
+    for (let j = 0; j < 3; j++) {
+      const u = mix(l0, r0, 0.1 + rand() * 0.75);
+      line([[u, v0 + 0.006], [u + 0.02 + rand() * 0.04, v0 + 0.006]], '#8f8e89', 0.005, '#0f0');
+    }
+  }
+  // stone balustrades either side of the steps
+  for (const [u0, u1] of [[0.475, 0.45], [0.865, 0.89]]) {
+    fill(shape([[u0 - 0.012, 0.49], [u0 + 0.012, 0.49], [u1 + 0.012, 0.8], [u1 - 0.012, 0.8]]), '#2c2b28');
+    line([[u0, 0.488], [u1, 0.79]], '#6a6863', 0.006);
+    for (let k = 0.1; k < 0.95; k += 0.12) {
+      const u = mix(u0, u1, k), v = mix(0.5, 0.79, k);
+      fill(rect(u - 0.006, v + 0.008, u + 0.006, v + 0.03), '#0f0f0e');
+    }
+  }
+
+  // the bridge running down to the bottom left, its carved railings
+  fill(shape([[0.47, 0.79], [0.87, 0.8], [0.64, 1.02], [0.16, 1.02]]), '#3c3a36', '#0f0');
+  for (let k = 0.08; k < 1; k += 0.09) line([[mix(0.47, 0.16, k), mix(0.79, 1.02, k)], [mix(0.87, 0.64, k), mix(0.8, 1.02, k)]], '#5a5853', 0.004, '#0f0');
+  for (const [a, b] of [[[0.47, 0.765], [0.13, 0.955]], [[0.88, 0.775], [0.65, 0.985]]]) {
+    const h = 0.06;
+    fill(shape([a, b, [b[0], b[1] + h], [a[0], a[1] + h]]), '#3a3834');
+    line([a, b], '#97948d', 0.009);
+    for (let k = 0.05; k < 0.95; k += 0.07) {
+      const u = mix(a[0], b[0], k), v = mix(a[1], b[1], k);
+      fill(rect(u - 0.01, v + 0.012, u + 0.01, v + h - 0.012), '#0c0c0b');
+      line([[u - 0.006, v + 0.02], [u + 0.006, v + h - 0.02]], '#55534e', 0.003);
+    }
+  }
+
+  // the carved post and lattice screen down the right edge
+  fill(rect(0.905, 0.12, 1.01, 1.01), '#1a1714');
+  for (let v = 0.13; v < 1; v += 0.034) {
+    for (let u = 0.91 + ((Math.round(v / 0.034) % 2) * 0.017); u < 1.01; u += 0.034) {
+      fill(rect(u, v, u + 0.022, v + 0.022), '#4e4a43');
+      line([[u + 0.004, v + 0.011], [u + 0.018, v + 0.011]], '#1a1714', 0.004);
+      line([[u + 0.011, v + 0.004], [u + 0.011, v + 0.018]], '#1a1714', 0.004);
+    }
+  }
+  fill(rect(0.885, 0.11, 0.912, 1.01), '#0d0c0a');
+  line([[0.909, 0.12], [0.909, 1]], '#2c2924', 0.003);
+  fill((c) => { c.beginPath(); c.ellipse(X(0.9), 0.12, 0.035, 0.03, 0, 0, TAU); }, '#0f0e0c');
+
+  // the eave of the building we're under, across the top left, tile ends along it
+  fill(shape([[0, 0], [0.66, 0], [BEAM[1][0], BEAM[1][1]], [BEAM[0][0], BEAM[0][1]]]), '#060706');
+  for (let u = 0; u < 0.62; u += 0.016) disc(u, mix(BEAM[0][1], BEAM[1][1], u / 0.62) - 0.002, 0.0055, '#33332f');
+
+  // dark plants in the foreground at the bottom
+  clump(0.6, 1.0, 0.14, 0.05, 220, '#0d120b', '#172014', '#25331f', '#000', 0.009);
+  clump(0.03, 0.98, 0.06, 0.06, 90, '#0d120b', '#172014', '#25331f', '#000', 0.009);
+
+  // each cell takes the average of the 3 × 3 pixels it covers
+  const pic = g.getImageData(0, 0, W3, H3).data, mk = m.getImageData(0, 0, W3, H3).data;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      let sr = 0, sg = 0, sb = 0, mr = 0, mg = 0, mb = 0;
+      for (let y = 0; y < SS; y++) {
+        for (let x = 0; x < SS; x++) {
+          const i = ((r * SS + y) * W3 + c * SS + x) * 4;
+          sr += pic[i]; sg += pic[i + 1]; sb += pic[i + 2];
+          mr += mk[i]; mg += mk[i + 1]; mb += mk[i + 2];
+        }
+      }
+      const k = r * cols + c, n = SS * SS * 255;
+      bgR[k] = lift(sr / n); bgG[k] = lift(sg / n); bgB[k] = lift(sb / n);
+      WATER[k] = mr / n; WET[k] = mg / n; MAPLE[k] = mb / n;
+    }
+  }
+}
+
+// The photo is nearly all shadow, and in dots shadow is just empty, so the still
+// picture is lifted through the middle: near-black stays black, the greys of
+// roofs, stone and leaves come up to where their shapes show, and the white
+// walls and sky stay brightest.
+function lift(v) { return Math.max(0, Math.pow(v, 0.62) - 0.09) * 1.12; }
+
+// --- the things that move ------------------------------------------------------------
+function buildScene() {
+  const rand = rng(SEED * 31 + 9);
+  const H = rows;
+  // branches hanging from above: [where they hang from, where the tip is] as [u, v]
+  // they're dark against the bright sky and walls, bunched along the top so
+  // the pavilion's roof stays clear, with one spray coming down over it
+  const BRANCHES = [
+    [0.3, 0.34, 0.12], [0.42, 0.46, 0.17], [0.52, 0.5, 0.08], [0.64, 0.62, 0.27],
+    [0.74, 0.77, 0.1], [0.86, 0.83, 0.14], [0.95, 0.97, 0.22], [1.02, 0.92, 0.1], [0.8, 0.72, 0.06],
+  ];
+  const branches = BRANCHES.map(([u0, u1, v1]) => {
+    const x0 = u0 * cols, y0 = -0.02 * H, x1 = u1 * cols, y1 = v1 * H;
+    const leaves = [];
+    const n = Math.round((y1 - y0) * 4.5 + 20);
+    for (let i = 0; i < n; i++) {
+      const k = 0.15 + 0.85 * Math.sqrt(rand());
+      // the branch sags a little as it goes
+      const bx = mix(x0, x1, k) + Math.sin(k * Math.PI) * (x1 - x0) * 0.15, by = mix(y0, y1, k);
+      const spread = 1 + k * H * 0.035;
+      leaves.push({
+        x: bx + (rand() - 0.5) * spread * 2, y: by + (rand() - 0.3) * spread,
+        r: H * (0.008 + rand() * 0.008), lit: rand(), ph: rand() * TAU,
+      });
+    }
+    return { x0, y0, leaves, ph: rand() * TAU, f: 0.6 + rand() * 0.5, amp: 0.025 + rand() * 0.02 };
+  });
+  // where drips form: along the eaves of both roofs and the beam above us
+  const drips = [];
+  for (const p of curve(EAVE, 12)) drips.push([p[0] * cols, (p[1] + 0.008) * H, 0.08 + 0.2 * clamp((Math.abs(p[0] - 0.65) - 0.15) * 5)]);
+  for (const p of curve(UPPER_EAVE, 10)) drips.push([p[0] * cols, (p[1] + 0.006) * H, 0.07]);
+  for (let u = 0.01; u < 0.62; u += 0.016) drips.push([u * cols, mix(BEAM[0][1], BEAM[1][1], u / 0.62) * H + 0.6, 0.15 + 0.45 * rand()]);
+  return {
+    branches, drips, rain: [], falling: [], rings: [], splashes: [], spawn: 0, leafSpawn: 0, dripSpawn: 0,
+    mist: 0, sway: 0,
+  };
+}
+
+// blend a colour over a cell, or add light to it
+function over(k, col, a) {
+  if (a <= 0) return;
+  if (a > 1) a = 1;
+  R[k] += (col[0] - R[k]) * a; G[k] += (col[1] - G[k]) * a; B[k] += (col[2] - B[k]) * a;
+}
+function add(k, col, a) { R[k] += col[0] * a; G[k] += col[1] * a; B[k] += col[2] * a; }
+
+// a soft round splat, over the picture or added as light
+function splat(x, y, rx, ry, col, a, additive) {
+  const x0 = Math.max(0, Math.floor(x - rx - 1)), x1 = Math.min(cols - 1, Math.floor(x + rx + 1));
+  const y0 = Math.max(0, Math.floor(y - ry - 1)), y1 = Math.min(rows - 1, Math.floor(y + ry + 1));
+  for (let r = y0; r <= y1; r++) {
+    for (let c = x0; c <= x1; c++) {
+      const d = Math.hypot((c + 0.5 - x) / rx, (r + 0.5 - y) / ry);
+      const cov = clamp((1 - d) * Math.min(rx, ry) + 0.5) * a;
+      if (cov <= 0) continue;
+      if (additive) add(r * cols + c, col, cov); else over(r * cols + c, col, cov);
+    }
+  }
+}
+
+// --- one frame ----------------------------------------------------------------------
+let lastT = 0;
+function render(t, paint = true) {
+  const dt = Math.min(0.2, Math.max(0, t - lastT));
+  lastT = t;
+  const H = rows;
+  const wind = windAt(t), gust = gustAt(t);
+  const sc = scene;
+  R.set(bgR); G.set(bgG); B.set(bgB);
+
+  // mist drifting over the walls and roofs behind, thicker up high. Its position
+  // is stepped along each frame at the wind's speed.
+  sc.mist += dt * (0.5 + 0.4 * wind);
+  const mistRows = Math.ceil(rows * 0.6);
+  const fc = Math.ceil(cols / FS) + 2, fr = Math.ceil(mistRows / FS) + 2;
+  for (let j = 0; j < fr; j++) {
+    for (let i = 0; i < fc; i++) {
+      const c = i * FS, r = j * FS;
+      FN[j * fc + i] = smooth(0.45, 0.8, fbm(c * 0.02 - sc.mist * 0.05, r * 0.05 + 2, 3) * 0.8 + noise(c * 0.07 - sc.mist * 0.12, r * 0.1) * 0.3);
+    }
+  }
+  for (let r = 0; r < mistRows; r++) {
+    const v = (r + 0.5) / rows;
+    const band = 0.35 * smooth(0.6, 0.15, v);
+    const j = (r / FS) | 0, fy = r / FS - j;
+    for (let c = 0; c < cols; c++) {
+      const i = (c / FS) | 0, fx = c / FS - i;
+      const q = j * fc + i;
+      const f = mix(mix(FN[q], FN[q + 1], fx), mix(FN[q + fc], FN[q + fc + 1], fx), fy);
+      if (f > 0.01) over(r * cols + c, C.mist, f * band);
+    }
+  }
+
+  // the water: slow ripples catching the light, finer further off
+  for (let r = Math.floor(rows * 0.44); r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c, w = WATER[k];
+      if (w < 0.05) continue;
+      const n = noise(c * 0.07 + t * 0.06, r * 0.55 - t * 0.5) * 0.6 + noise(c * 0.16 - t * 0.05, r * 1.1 - t * 0.9) * 0.4;
+      add(k, C.sheen, smooth(0.6, 0.9, n) * 0.22 * w);
+    }
+  }
+
+  // wet stone: rain spatters glinting on the steps, the floor and the bridge
+  for (let r = Math.floor(rows * 0.55); r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c, w = WET[k];
+      if (w < 0.05) continue;
+      const n = noise(c * 0.6 + t * 2.1, r * 0.8 - t * 3.3);
+      add(k, C.splash, smooth(0.78, 0.95, n) * 0.25 * w * Math.min(1, RAIN));
+    }
+  }
+
+  // the lanterns: a warm glow round each, flickering, swaying a little on their cords
+  for (let i = 0; i < LANTERNS.length; i++) {
+    const [u, v] = LANTERNS[i];
+    const sway = (0.05 + 0.1 * wind) * Math.sin(t * 1.3 + i * 2.1);
+    const len = H * 0.02;
+    const x = u * cols + Math.sin(sway) * len, y = v * rows + Math.cos(sway) * len;
+    const flick = 0.85 + 0.1 * Math.sin(t * 7.3 + i) + 0.08 * (noise(t * 2.7, i * 5) - 0.5);
+    splat(x, y, H * 0.07, H * 0.07, C.glow, 0.3 * flick, true);
+    splat(x, y, H * 0.013, H * 0.018, C.lantern, 1, false);
+    splat(x, y - H * 0.002, H * 0.007, H * 0.01, C.lanternLit, 0.9 * flick, false);
+    splat(x, y - H * 0.018, H * 0.008, H * 0.003, C.cap, 1, false);
+    splat(x, y + H * 0.018, H * 0.008, H * 0.003, C.cap, 1, false);
+  }
+
+  // rain: drops falling, slanting with the wind; where they land, a splash on
+  // stone or a ring on the water
+  if (RAIN > 0) {
+    const want = Math.round(RAIN * cols * rows / 240);
+    const rain = sc.rain;
+    while (rain.length < want) rain.push({ x: Math.random() * cols * 1.2 - cols * 0.1, y: Math.random() * rows, to: rows * (0.3 + 0.75 * Math.random()), v: 0 });
+    if (rain.length > want) rain.length = want;
+    const slant = 0.1 + 0.15 * wind;
+    for (const d of rain) {
+      if (!d.v) d.v = (55 + Math.random() * 25) * (H / 120);
+      d.y += d.v * dt; d.x += d.v * slant * dt;
+      if (d.y >= d.to) {
+        const c = Math.floor(d.x), r = Math.floor(d.to);
+        if (c >= 0 && c < cols && r >= 0 && r < rows) {
+          const k = r * cols + c;
+          if (WATER[k] > 0.5) sc.rings.push({ x: d.x, y: d.to, s: 0.5 + (d.to / rows) * 0.8, age: 0 });
+          else if (WET[k] > 0.3) sc.splashes.push({ x: d.x, y: d.to, age: 0 });
+        }
+        d.x = Math.random() * cols * 1.2 - cols * 0.1; d.y = -Math.random() * 6; d.to = rows * (0.3 + 0.75 * Math.random()); d.v = 0;
+        continue;
+      }
+      for (let j = 0; j < 3; j++) {
+        const c = Math.floor(d.x - j * slant), r = Math.floor(d.y - j);
+        if (c >= 0 && c < cols && r >= 0 && r < rows) add(r * cols + c, C.rain, 0.3 - j * 0.08);
+      }
+    }
+  }
+
+  // drips gathering on the eaves and falling
+  sc.dripSpawn += dt * RAIN * 6;
+  while (sc.dripSpawn >= 1) {
+    sc.dripSpawn -= 1;
+    const [x, y, fall] = sc.drips[(Math.random() * sc.drips.length) | 0];
+    sc.falling.push({ x, y, y0: y, to: y + fall * H * (0.7 + 0.6 * Math.random()), v: 0, hang: 0.4 + Math.random() * 0.6, drip: true });
+  }
+
+  // maple leaves now and then letting go, more in a gust, and floating once they land
+  sc.leafSpawn += dt * (0.12 + 0.6 * gust) * WIND;
+  while (sc.leafSpawn >= 1) {
+    sc.leafSpawn -= 1;
+    for (let tries = 0; tries < 20; tries++) {
+      const c = Math.floor(Math.random() * cols * 0.32), r = Math.floor(rows * (0.42 + Math.random() * 0.25));
+      if (MAPLE[r * cols + c] > 0.6) {
+        sc.falling.push({ x: c + 0.5, y: r + 0.5, to: rows * (0.6 + Math.random() * 0.35), v: 0, spin: Math.random() * TAU, ph: Math.random() * TAU, drip: false, life: 0 });
+        break;
+      }
+    }
+  }
+  const falling = sc.falling;
+  for (let i = falling.length - 1; i >= 0; i--) {
+    const f = falling[i];
+    if (f.drip) {
+      // a drop swells on the eave, lets go and falls faster and faster
+      if (f.hang > 0) {
+        f.hang -= dt;
+        splat(f.x, f.y, 0.35, 0.45, C.splash, 0.35 * clamp(1 - f.hang), true);
+        continue;
+      }
+      f.v += 90 * (H / 120) * dt; f.y += f.v * dt;
+      if (f.y >= f.to) {
+        const k = Math.floor(f.to) * cols + Math.floor(f.x);
+        if (k >= 0 && k < N && WATER[k] > 0.5) sc.rings.push({ x: f.x, y: f.to, s: 0.8, age: 0 });
+        else sc.splashes.push({ x: f.x, y: f.to, age: 0 });
+        falling.splice(i, 1);
+        continue;
+      }
+      splat(f.x, f.y, 0.3, 0.7, C.splash, 0.5, true);
+      continue;
+    }
+    // a leaf: flutters down and drifts with the wind, then floats on the water
+    f.life += dt;
+    if (f.v !== null) {
+      f.spin += dt * 4;
+      f.x += (1 + 2.5 * wind + Math.sin(t * 2 + f.ph) * 1.5) * dt * (H / 120);
+      f.y += (3 + Math.sin(t * 3.1 + f.ph)) * dt * (H / 120);
+      if (f.y >= f.to) {
+        const k = Math.floor(f.y) * cols + Math.floor(f.x);
+        if (k >= 0 && k < N && WATER[k] > 0.5) { f.v = null; f.life = 0; } else { falling.splice(i, 1); continue; }
+      }
+    } else {
+      // afloat: carried slowly along, fading after a while
+      f.x += 0.25 * (H / 120) * dt;
+      if (f.life > 30) { falling.splice(i, 1); continue; }
+    }
+    if (f.x < -2 || f.x > cols + 2) { falling.splice(i, 1); continue; }
+    const face = f.v === null ? 1 : 0.4 + 0.6 * Math.abs(Math.cos(f.spin));
+    const fade = f.v === null ? clamp((30 - f.life) / 5) : 1;
+    splat(f.x, f.y, 0.75 * face + 0.15, 0.5, f.v === null ? C.maple : C.mapleLit, 0.95 * fade, false);
+  }
+
+  // rings opening on the water, and splashes bouncing off the stone
+  const rings = sc.rings;
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const g = rings[i];
+    g.age += dt;
+    const life = 1.2;
+    if (g.age > life) { rings.splice(i, 1); continue; }
+    const rad = 0.5 + g.age * 2.4 * g.s, amp = (1 - g.age / life) * 0.35, ry = 0.38;
+    for (let r = Math.max(0, Math.floor(g.y - rad * ry - 1)); r <= Math.min(rows - 1, Math.ceil(g.y + rad * ry + 1)); r++) {
+      for (let c = Math.max(0, Math.floor(g.x - rad - 1)); c <= Math.min(cols - 1, Math.ceil(g.x + rad + 1)); c++) {
+        const k = r * cols + c;
+        if (WATER[k] < 0.3) continue;
+        const e = Math.hypot(c + 0.5 - g.x, (r + 0.5 - g.y) / ry);
+        const ring = Math.exp(-(((e - rad) / 0.6) ** 2)) * amp;
+        if (ring > 0.01) add(k, C.sheen, ring);
+      }
+    }
+  }
+  const splashes = sc.splashes;
+  for (let i = splashes.length - 1; i >= 0; i--) {
+    const s = splashes[i];
+    s.age += dt;
+    if (s.age > 0.2) { splashes.splice(i, 1); continue; }
+    splat(s.x, s.y - s.age * 4, 0.4, 0.4, C.splash, 0.5 * (1 - s.age / 0.2), true);
+  }
+
+  // the leaves hanging from above, swinging on their branches
+  for (const b of sc.branches) {
+    const th = b.amp * (0.3 + wind) * Math.sin(t * b.f + b.ph) + 0.015 * wind;
+    for (const l of b.leaves) {
+      const flut = 0.15 * (0.3 + wind) * Math.sin(t * 3 + l.ph);
+      const x = l.x + th * (l.y - b.y0) + flut, y = l.y;
+      const col = l.lit > 0.88 ? C.leafLit : l.lit > 0.45 ? C.leaf : C.leafDark;
+      splat(x, y, l.r * 1.25, l.r, col, 0.95, false);
+    }
+  }
+
+  // --- to dots ----------------------------------------------------------------------
+  const PL = PAL.length;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = r * cols + c;
+      const cr = R[k], cg = G[k], cb = B[k];
+      const peak = Math.max(cr, cg, cb);
+      if (peak < 0.004) { out[k] = 0; continue; }
+      const level = LEVEL[Math.min(1023, (peak * 1023 + 0.5) | 0)];
+      const step = Math.max(0, Math.min(NL, Math.round(level * NL + DITHER[k])));
+      if (!step) { out[k] = 0; continue; }
+      const want = clamp((level + 0.02) / COVER[step]);
+      // the dot's colour: the cell's hue, lifted to make up for the dot's size, but
+      // never so far that a dim cell's dots come out bright
+      const s = Math.min(1.4, (0.25 + 0.75 * want) / peak);
+      out[k] = 1 + (step - 1) * PL + nearest(clamp(cr * s), clamp(cg * s), clamp(cb * s));
+    }
+  }
+  if (paint) draw();
+}
+
+// copy changed cells from the atlas
+function draw() {
+  const PL = PAL.length;
+  ctx.fillStyle = GROUND;
+  for (let k = 0; k < N; k++) {
+    if (out[k] === prev[k]) continue;
+    const c = k % cols, r = (k / cols) | 0;
+    ctx.fillRect(c * px, r * px, px, px);
+  }
+  for (let k = 0; k < N; k++) {
+    const o = out[k];
+    if (o === prev[k]) continue;
+    prev[k] = o;
+    if (!o) continue;
+    const c = k % cols, r = (k / cols) | 0;
+    const step = 1 + (((o - 1) / PL) | 0), ci = (o - 1) % PL;
+    ctx.drawImage(atlas, ci * px, (step - 1) * px, px, px, c * px, r * px, px, px);
+  }
+}
+
+// --- run ----------------------------------------------------------------------------
+let resizeTimer = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    // start over only when the grid itself changes, not on every resize event
+    const [p, c, r] = grid();
+    if (p === px && c === cols && r === rows) return;
+    layout();
+    render(clock());
+  }, 150);
+});
+// WebKit can throw away a hidden page's canvas, and only cells that change get
+// redrawn, so paint every cell again when the page comes back
+function repaint() {
+  prev.fill(0xffff);
+  render(clock());
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) repaint(); });
+canvas.addEventListener('contextrestored', repaint);
+const t0 = performance.now();
+// time stands still while the wallpaper is paused, so nothing jumps when it's back
+let pausedAt = 0, pausedFor = 0;
+const clock = () => ((pausedAt || performance.now()) - t0 - pausedFor) / 1000 + (+Q.get('t') || 0);
+layout();
+// let the rain be falling already
+for (let i = 0; i < 30; i++) render(clock() - 3 + i * 0.1, false);
+render(clock());
+let last = 0, frame = 0;
+function loop(now) {
+  frame = requestAnimationFrame(loop);
+  if (now - last < 1000 / FPS - 4) return;
+  last = now;
+  render(clock());
+}
+if (Q.get('still') !== '1') frame = requestAnimationFrame(loop);
+// The macOS helper calls this as windows cover and uncover the wallpaper: it
+// stops drawing while nobody can see it, and leaves the last frame in place.
+window.__setPaused = (pause) => {
+  if (Q.get('still') === '1' || !pause === !pausedAt) return;
+  if (pause) {
+    pausedAt = performance.now();
+    cancelAnimationFrame(frame);
+  } else {
+    pausedFor += performance.now() - pausedAt;
+    pausedAt = 0;
+    frame = requestAnimationFrame(loop);
+  }
+};
+// for recording previews: draw the frame at a given time
+window.__render = (t) => render(t);
+})();
+</script>
+</body>
+</html>

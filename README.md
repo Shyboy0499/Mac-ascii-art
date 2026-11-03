@@ -32,6 +32,21 @@ A dark mountain lake under low cloud: grey fog, a spiky spruce treeline, black w
 Its options are `cell`, `fps`, `wind`, `seed`, `ramp` and `still` as below, plus `rain` (`0` for
 none, `2` or `3` for heavier rain) in place of `petals`.
 
+## Rain Garden Pavilion: `garden.html`
+
+A classical Chinese garden in the rain: a two-storey pavilion with upswept eaves over dark water,
+wet stone steps down to a carved bridge, a red maple, a lattice screen and leaves hanging from above.
+
+![Rain Garden Pavilion, animated](assets/garden-preview.gif)
+
+- **Rain** falls, ringing the water and spattering on the wet steps and bridge.
+- **The eaves drip**: drops gather on the roof edges and the eave above, and fall.
+- **Two red lanterns** glow and sway under the roof.
+- **The hanging leaves** swing in the wind, and maple leaves now and then drop and float away.
+- **Mist** drifts over the walls and roofs behind.
+
+It takes the same options as the lake (`rain`, `wind`, `cell`, `fps`, `seed`, `ramp`, `still`).
+
 ## Set it as your Mac wallpaper
 
 macOS can't use an animated web page as a wallpaper on its own. The free app **Plash** fills that
@@ -42,10 +57,11 @@ gap: it shows any website (online or a local file) as your desktop wallpaper, be
    - **Online (easiest):** in this repository on GitHub open **Settings → Pages**. Under
      *Build and deployment* choose **Deploy from a branch**, pick the branch with these files and
      **/ (root)**, then **Save**. After a minute or so the scenes are live at
-     <https://shyboy0499.github.io/Mac-ascii-art/> and
-     <https://shyboy0499.github.io/Mac-ascii-art/lake.html>
+     <https://shyboy0499.github.io/Mac-ascii-art/>,
+     <https://shyboy0499.github.io/Mac-ascii-art/lake.html> and
+     <https://shyboy0499.github.io/Mac-ascii-art/garden.html>
    - **Offline:** download this repo (**Code → Download ZIP**), unzip it somewhere it will stay
-     (for example `~/Pictures/Mac-ascii-art`), and use its `index.html` or `lake.html`.
+     (for example `~/Pictures/Mac-ascii-art`), and use its `index.html`, `lake.html` or `garden.html`.
 3. **Add it in Plash:** click Plash's icon in the menu bar → **Add Website**, paste the link (or
    choose the local file), and it becomes your wallpaper.
 
@@ -57,7 +73,7 @@ Plash has two limits worth knowing:
 - It leaves out the **menu bar strip** at the top of the screen. If you hide the macOS menu bar
   (for example behind SketchyBar), your old wallpaper shows through there. Setting the normal macOS
   wallpaper to a solid colour (System Settings → Wallpaper → Colors → Add Color) makes that strip
-  match: `#0B0F19` for the plum blossom, `#050906` for the lake.
+  match: `#0B0F19` for the plum blossom, `#050906` for the lake, `#050605` for the garden.
 
 ### Every display, edge to edge: the built-in helper
 
@@ -72,6 +88,7 @@ Plash first so the two don't stack. Then run this from the repository folder:
 swiftc -O macos/wallpaper.swift -o ascii-wallpaper
 ./ascii-wallpaper                              # this folder's index.html
 ./ascii-wallpaper lake.html                    # the swan lake
+./ascii-wallpaper garden.html                  # the rain garden
 ./ascii-wallpaper "index.html?fps=10&petals=2" # with options
 ./ascii-wallpaper "ascii-rest.html?piece=lantern-lake"
 ```
