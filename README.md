@@ -34,18 +34,20 @@ none, `2` or `3` for heavier rain) in place of `petals`.
 
 ## Rain Garden Pavilion: `garden.html`
 
-A classical Chinese garden in the rain: a two-storey pavilion with upswept eaves over dark water,
-wet stone steps down to a carved bridge, a red maple, a lattice screen and leaves hanging from above.
+A classical Chinese garden in the rain, drawn from a wide slice of the photo itself (carried in the
+file, so it still works offline): a pavilion with upswept eaves and red lanterns, wet stone steps down
+to the water, a red maple, and a grey gallery behind. The photo is almost all deep shadow, so its
+lightness is lifted a long way while each colour keeps its hue.
 
 ![Rain Garden Pavilion, animated](assets/garden-preview.gif)
 
-- **Rain** falls, ringing the water and spattering on the wet steps and bridge.
-- **The eaves drip**: drops gather on the roof edges and the eave above, and fall.
-- **Two red lanterns** glow and sway under the roof.
-- **The hanging leaves** swing in the wind, and maple leaves now and then drop and float away.
-- **Mist** drifts over the walls and roofs behind.
+- **Rain** falls, ringing the water and spattering on the wet steps.
+- **The eaves drip**: drops gather on the pavilion's roof and the gallery's, and fall.
+- **Two red lanterns** glow, flicker and sway under the roof.
+- **Maple leaves** now and then drop and float away on the water.
+- **Mist** drifts across the roofs.
 
-It takes the same options as the lake (`rain`, `wind`, `cell`, `fps`, `seed`, `ramp`, `still`).
+Its options are `rain`, `wind`, `cell`, `fps`, `ramp` and `still`.
 
 ## Set it as your Mac wallpaper
 
